@@ -1,0 +1,74 @@
+name: Paperview
+options:
+  bundleIdPrefix: com.debeltoni
+  deploymentTarget:
+    iOS: '18.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    TARGETED_DEVICE_FAMILY: '1,2'
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 13
+    MARKETING_VERSION: 1.0
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  Paperview:
+    type: application
+    platform: iOS
+    sources:
+      - path: Paperview
+    info:
+      path: Paperview/Info.plist
+      properties:
+        CFBundleDisplayName: Paperview
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UIApplicationSupportsIndirectInputEvents: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.debeltoni.Paperview
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+  PaperviewTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [PaperviewTests]
+    dependencies:
+      - target: Paperview
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.debeltoni.PaperviewTests
+  PaperviewUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [PaperviewUITests]
+    dependencies:
+      - target: Paperview
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.debeltoni.PaperviewUITests
+schemes:
+  Paperview:
+    build:
+      targets:
+        Paperview: all
+        PaperviewTests: [test]
+        PaperviewUITests: [test]
+    test:
+      gatherCoverageData: true
+      targets:
+        - name: PaperviewTests
+        - name: PaperviewUITests

@@ -1,0 +1,13 @@
+*.xcodeproj/
+Paperview/Info.plist
+build/
+DerivedData/
+*.xcresult/
+__pycache__/
+.DS_Store
+*.ipa
+*.app/
+*.mobileprovision
+*.p12
+*.p8
+*.cer
