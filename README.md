@@ -1,20 +1,23 @@
 # Paperview
 
-An iPadOS/iOS client for [Space](https://space.toni.foo), with a native PDFKit reader and PencilKit annotation tools. The dashboard and collaborative whiteboards load the live Space website in WKWebView.
+An iPadOS/iOS client for [Space](https://space.toni.foo), with a native UIKit dashboard and collaborative board, a PDFKit reader, and PencilKit handwriting. WebKit is used for authentication, guest bootstrap, and sandboxed HTML content.
 
 ## Use with Space
 
-The app automatically connects to **https://space.toni.foo**. No backend secrets, API keys, server configuration, or Space source checkout are needed. Sign up or sign in through the app using your own account. Space access requires the server owner's approval; private spaces require a separate invitation or membership.
+The app automatically connects to **https://space.toni.foo**. No backend secrets, API keys, server configuration, or backend/web source checkout are needed to use the app. Sign up or sign in through the app using your own account. Space access requires the server owner's approval; private spaces require a separate invitation or membership.
 
-This repository contains only the Apple client. Space's backend and web app are maintained separately and are not covered by this repository's license. The hosted service has its own access controls and may change independently of this client.
+This repository contains the Apple client, not the Space backend, web app, or Rust engine source. The native board links a separately licensed engine binary; it is not covered by this repository’s MIT license. The hosted service has its own access controls and may change independently of this client. Native board changes require an app rebuild and update; deploying the website does not update the native board. See [NATIVE-BOARD.md](NATIVE-BOARD.md).
 
 ## Build and install
 
 Requirements: a Mac with Xcode and its iOS SDK, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and an iPad or iPhone running iOS/iPadOS 18 or later. Verified with Xcode 27.0 and Swift 5 language mode.
 
+Before generating the project, obtain a compatible, separately licensed `Vendor/SpaceEngine.xcframework` from the owner, or generate it from an authorized private Space checkout as described in [NATIVE-BOARD.md](NATIVE-BOARD.md). Public clients do not need the backend or web source.
+
 ```sh
 git clone https://github.com/DebelToni/Paperview.git
 cd Paperview
+# Place the separately licensed framework at Vendor/SpaceEngine.xcframework first.
 xcodegen generate
 open Paperview.xcodeproj
 ```
@@ -27,7 +30,7 @@ In Xcode:
 
 The project deliberately does not specify a development team. Your Apple signing credentials stay in Xcode; never commit certificates, provisioning profiles, passwords, or generated build products. Keep the same team and bundle identifier for future updates so that the app retains its local data.
 
-Free Apple-account provisioning normally expires after seven days. Re-sign and update your installation with Xcode before expiry; each person's provisioning schedule is independent. Do not uninstall to renew: uninstalling removes pending local annotations. Paid developer-account provisioning has different limits.
+Free Apple-account provisioning normally expires after seven days. Re-sign and update your installation with Xcode before expiry; each person's provisioning schedule is independent. Do not uninstall to renew: uninstalling removes pending local edits and archives. Paid developer-account provisioning has different limits.
 
 For an unsigned simulator build:
 
@@ -63,4 +66,4 @@ Choose an available iPad simulator from `xcrun simctl list devices available`. T
 
 ## License
 
-[MIT](LICENSE), copyright Anton Ivanov. Apple frameworks and development tools remain subject to their respective terms.
+[MIT](LICENSE), copyright Anton Ivanov, applies to this client. The required Space engine binary is separately licensed and is not covered by MIT. Third-party text-tool and SwiftMath notices are in [TextTools-LICENSES.txt](Paperview/Board/Resources/TextTools-LICENSES.txt); SwiftMath’s packaged `mathFonts.bundle` carries its font notices. Apple frameworks and development tools remain subject to their respective terms.

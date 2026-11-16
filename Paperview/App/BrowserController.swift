@@ -18,6 +18,9 @@ final class BrowserController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var opening = false
     private var readerActive = false
     private var retryURL: URL?
+    var initialURL: URL?
+    var authenticationOnly = false
+    var onNativeNavigation: ((URL) -> Void)?
 
     override func loadView() {
         let configuration = WKWebViewConfiguration()
@@ -29,6 +32,10 @@ final class BrowserController: UIViewController, WKNavigationDelegate, WKUIDeleg
         handler.owner = self
         configuration.userContentController.add(handler, name: "paper")
         configuration.userContentController.add(handler, name: "boardTrackpad")
+        if onNativeNavigation != nil {
+            configuration.userContentController.add(handler, name: "nativeRoute")
+            configuration.userContentController.addUserScript(WKUserScript(source: WebBridge.nativeRouteScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
         configuration.userContentController.addUserScript(WKUserScript(source: WebBridge.script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         configuration.userContentController.addUserScript(WKUserScript(source: BoardTrackpad.script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         webView = WKWebView(frame: .zero, configuration: configuration)
@@ -60,9 +67,9 @@ final class BrowserController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        var start = bridge.origin
+        var start = initialURL ?? bridge.origin
         #if DEBUG
-        if let route = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--space-test-route=") })?.split(separator: "=", maxSplits: 1).last,
+        if initialURL == nil, let route = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--space-test-route=") })?.split(separator: "=", maxSplits: 1).last,
            let candidate = URL(string: String(route), relativeTo: bridge.origin)?.absoluteURL, bridge.trusts(candidate) { start = candidate }
         #endif
         #if DEBUG
@@ -83,7 +90,7 @@ final class BrowserController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        navigationController?.setNavigationBarHidden(true, animated: animated)
+        navigationController?.setNavigationBarHidden(!authenticationOnly, animated: animated)
         if readerActive && navigationController?.topViewController === self {
             readerActive = false
             webView.evaluateJavaScript("window.__paperviewResume?.()", completionHandler: nil)
@@ -114,18 +121,23 @@ final class BrowserController: UIViewController, WKNavigationDelegate, WKUIDeleg
     @objc private func retryLoad() { if let url = retryURL { load(url) } }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard ["paper", "boardTrackpad"].contains(message.name), message.frameInfo.isMainFrame,
+        guard ["paper", "boardTrackpad", "nativeRoute"].contains(message.name), message.frameInfo.isMainFrame,
               let frameURL = message.frameInfo.request.url, bridge.trusts(frameURL),
               let current = webView.url, bridge.trusts(current) else { return }
         let security = message.frameInfo.securityOrigin
         guard security.protocol == bridge.origin.scheme, security.host == bridge.origin.host,
               (security.port == 0 ? (security.protocol == "https" ? 443 : 80) : security.port) == (bridge.origin.port ?? (bridge.origin.scheme == "https" ? 443 : 80)) else { return }
+        if message.name == "nativeRoute" {
+            guard let raw = message.body as? String, let url = URL(string: raw), NativeSpaceRoute.parse(url, bridge: bridge) != nil else { return }
+            onNativeNavigation?(url); return
+        }
         if message.name == "boardTrackpad" {
             if let active = message.body as? Bool { trackpad.setBoardActive(active) }
             return
         }
         guard let raw = message.body as? String, let url = URL(string: raw), let route = bridge.paper(url) else { return }
-        openPaper(route)
+        if let onNativeNavigation { onNativeNavigation(url) }
+        else { openPaper(route) }
     }
 
     private func openPaper(_ route: PaperRoute) {
@@ -158,6 +170,10 @@ final class BrowserController: UIViewController, WKNavigationDelegate, WKUIDeleg
         guard let url = action.request.url else { decisionHandler(.cancel); return }
         guard !readerActive && !opening else { decisionHandler(.cancel); return }
         if bridge.permitsNavigation(url) {
+            if action.targetFrame?.isMainFrame != false, bridge.trusts(url), NativeSpaceRoute.parse(url, bridge: bridge) != nil,
+               let onNativeNavigation {
+                decisionHandler(.cancel); onNativeNavigation(url); return
+            }
             if action.targetFrame?.isMainFrame != false, let paper = bridge.paper(url) {
                 decisionHandler(.cancel); openPaper(paper); return
             }
