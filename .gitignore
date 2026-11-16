@@ -11,3 +11,5 @@ __pycache__/
 *.p12
 *.p8
 *.cer
+Vendor/
+node_modules/

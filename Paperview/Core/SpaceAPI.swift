@@ -8,6 +8,7 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
     let origin: URL
     private(set) var storageIdentity: String
     private var boundOwner: String?
+    var nativeSpaceCache: SpaceSnapshot?
     private let cookies: [HTTPCookie]
     private let session: URLSession
     private let redirect = NoRedirect()
@@ -33,12 +34,34 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
     private func request(_ id: String, _ suffix: String = "", method: String = "GET", body: Data? = nil, pdf: Bool = false, me: Bool = false) async throws -> Data {
         let paperURL = try url(id, suffix)
         let target = me ? origin.appendingPathComponent("api/me") : paperURL
+        return try await nativeRequest(target: target, method: method, body: body, contentType: "application/json", limit: pdf ? 40 * 1024 * 1024 + 1024 : 25 * 1024 * 1024, accept: pdf ? "application/pdf" : "application/json")
+    }
+    func bindAnonymous() throws {
+        guard boundOwner == nil || boundOwner == "anonymous" else { throw PaperError.unauthorized }
+        boundOwner = "anonymous"
+        storageIdentity = origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "\nanonymous"
+    }
+    func bindAccount(_ id: String) throws {
+        let owner = "account:" + id
+        guard !id.isEmpty, boundOwner == nil || boundOwner == owner else { throw PaperError.unauthorized }
+        boundOwner = owner
+        storageIdentity = origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "\n" + owner
+    }
+    func nativeRequest(target: URL, method: String = "GET", body: Data? = nil, contentType: String = "application/json", limit: Int = 25 * 1024 * 1024, accept: String = "application/json") async throws -> Data {
+        try await nativePayload(target: target, method: method, body: body, contentType: contentType, limit: limit, accept: accept).data
+    }
+    struct NativePayload { var data: Data; var mimeType: String; var headers: [String: String] = [:] }
+    func nativePayload(target: URL, method: String = "GET", body: Data? = nil, contentType: String = "application/json", limit: Int = 25 * 1024 * 1024, accept: String = "application/json") async throws -> NativePayload {
+        guard origin.host != nil, target.scheme == origin.scheme, target.host == origin.host, target.port == origin.port,
+              target.user == nil, target.password == nil, target.fragment == nil,
+              origin.user == nil, origin.password == nil, origin.query == nil, origin.fragment == nil,
+              origin.path.isEmpty || origin.path == "/", ["http", "https"].contains(origin.scheme ?? "") else { throw PaperError.invalidURL }
         var req = URLRequest(url: target)
         req.httpMethod = method; req.httpBody = body; req.httpShouldHandleCookies = false
-        req.setValue(pdf ? "application/pdf" : "application/json", forHTTPHeaderField: "Accept")
+        req.setValue(accept, forHTTPHeaderField: "Accept")
         if method != "GET" {
             req.setValue(origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")), forHTTPHeaderField: "Origin")
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
         let selected = cookies.filter { cookie in
             let domain = cookie.domain.hasPrefix(".") ? String(cookie.domain.dropFirst()) : cookie.domain
@@ -49,12 +72,11 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
             return domainOK && pathOK && (!cookie.isSecure || target.scheme == "https") && (cookie.expiresDate == nil || cookie.expiresDate! > Date())
         }
         for (key, value) in HTTPCookie.requestHeaderFields(with: selected) { req.setValue(value, forHTTPHeaderField: key) }
-        let limit = pdf ? 40 * 1024 * 1024 + 1024 : 25 * 1024 * 1024
-        if let body, body.count > 25 * 1024 * 1024 { throw PaperError.oversized }
+        if let body, body.count > (contentType.hasPrefix("multipart/") ? 41 * 1024 * 1024 : 25 * 1024 * 1024) { throw PaperError.oversized }
         return try await Self.transfer(req, session: session, redirect: redirect, limit: limit)
     }
     // Keep bounded streaming off the UI actor, including PDF byte iteration.
-    private nonisolated static func transfer(_ request: URLRequest, session: URLSession, redirect: NoRedirect, limit: Int) async throws -> Data {
+    private nonisolated static func transfer(_ request: URLRequest, session: URLSession, redirect: NoRedirect, limit: Int) async throws -> NativePayload {
         let (bytes, response) = try await session.bytes(for: request, delegate: redirect)
         guard let http = response as? HTTPURLResponse, http.url == request.url else { throw PaperError.invalidResponse }
         guard response.expectedContentLength <= limit else { throw PaperError.oversized }
@@ -66,7 +88,10 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
             struct Detail: Decodable { var detail: String }
             throw PaperError.http(http.statusCode, (try? JSONDecoder().decode(Detail.self, from: data).detail) ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode))
         }
-        return data
+        let headers = http.allHeaderFields.reduce(into: [String: String]()) { result, pair in
+            if let key = pair.key as? String, let value = pair.value as? String { result[key] = value }
+        }
+        return NativePayload(data: data, mimeType: response.mimeType ?? "application/octet-stream", headers: headers)
     }
     func metadata(paperID: String) async throws -> PaperMetadata {
         let metadata = try JSONDecoder().decode(PaperMetadata.self, from: await request(paperID))
