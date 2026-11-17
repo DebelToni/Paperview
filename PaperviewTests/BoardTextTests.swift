@@ -106,4 +106,40 @@ final class BoardTextTests: XCTestCase {
             XCTAssertEqual(layout.source,element.text); XCTAssertGreaterThan(layout.size.height,0)
         }
     }
+    func testLayoutSignatureExcludesGeometryAndRevisionButIncludesVisualStyle() {
+        var e = BoardElement(kind: .text); e.text = "# Stable layout $x^2$"
+        let initial = BoardTextLayout.Signature(e)
+        e.x = 500; e.y = -40; e.width = 900; e.height = 120; e.angle = 0.6; e.z = 100; e.version = 12
+        XCTAssertEqual(initial, BoardTextLayout.Signature(e))
+        e.stroke = "#0000ff"
+        XCTAssertNotEqual(initial, BoardTextLayout.Signature(e))
+        e.stroke = "#202124"; e.fontSize = 36
+        XCTAssertNotEqual(initial, BoardTextLayout.Signature(e))
+    }
+
+    func testDistinctLargeMathAttachmentsStayWithinLayoutBudget() throws {
+        var element = BoardElement(kind: .text)
+        element.fontSize = 128
+        element.text = (0..<80).map { "$\\frac{x_{\($0)}}{y}$" }.joined(separator: " ")
+        let layout = try BoardTextLayout(element: element, width: 1024)
+        XCTAssertEqual(layout.source, element.text)
+        XCTAssertGreaterThan(layout.attachmentBytes, 0)
+        XCTAssertLessThanOrEqual(layout.attachmentBytes, BoardTextLayout.attachmentByteLimit)
+        XCTAssertGreaterThan(layout.sourceMathFallbackCount, 0)
+        XCTAssertGreaterThanOrEqual(layout.estimatedCost, layout.attachmentBytes + element.text!.utf16.count * 48)
+        XCTAssertTrue(layout.size.height.isFinite)
+    }
+
+    func testRepeatedMathChargesSharedBitmapOnceAndNormalMathFits() throws {
+        var element = BoardElement(kind: .text)
+        element.text = "$\\frac{a}{b}$"
+        let single = try BoardTextLayout(element: element, width: 600)
+        element.text = Array(repeating: element.text!, count: 100).joined(separator: " ")
+        let repeated = try BoardTextLayout(element: element, width: 600)
+        XCTAssertGreaterThan(single.attachmentBytes, 0)
+        XCTAssertEqual(repeated.attachmentBytes, single.attachmentBytes)
+        XCTAssertEqual(repeated.sourceMathFallbackCount, 0)
+        XCTAssertLessThan(repeated.estimatedCost, BoardTextLayout.attachmentByteLimit)
+    }
+
 }

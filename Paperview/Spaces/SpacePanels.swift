@@ -6,16 +6,16 @@ import UniformTypeIdentifiers
         from.present(UINavigationController(rootViewController: SpaceAccountController(api: api, onSignOut: onSignOut)), animated: true)
     }
     enum Kind { case settings, history, papers, agents, imports }
-    static func present(kind: Kind, from: UIViewController, api: SpaceAPI, session: BoardSession, onOpenPaper: ((String) -> Void)? = nil) {
+    static func present(kind: Kind, from: UIViewController, api: SpaceAPI, session: BoardSession, onOpenPaper: ((String) -> Void)? = nil, onAddPaper: (() -> Void)? = nil) {
         guard let snapshot = session.snapshot, session.authorized else { return }
         let panel = SpacePanelController(kind: kind, api: api, session: session, snapshot: snapshot)
-        panel.onOpenPaper = onOpenPaper
+        panel.onOpenPaper = onOpenPaper; panel.onAddPaper = onAddPaper
         let navigation = UINavigationController(rootViewController: panel); navigation.modalPresentationStyle = .pageSheet
         from.present(navigation, animated: true)
     }
     static func presentSettings(from: UIViewController, api: SpaceAPI, session: BoardSession) { present(kind: .settings, from: from, api: api, session: session) }
     static func presentHistory(from: UIViewController, api: SpaceAPI, session: BoardSession) { present(kind: .history, from: from, api: api, session: session) }
-    static func presentPapers(from: UIViewController, api: SpaceAPI, session: BoardSession, onOpenPaper: ((String) -> Void)? = nil) { present(kind: .papers, from: from, api: api, session: session, onOpenPaper: onOpenPaper) }
+    static func presentPapers(from: UIViewController, api: SpaceAPI, session: BoardSession, onOpenPaper: ((String) -> Void)? = nil, onAddPaper: (() -> Void)? = nil) { present(kind: .papers, from: from, api: api, session: session, onOpenPaper: onOpenPaper, onAddPaper: onAddPaper) }
     static func presentAgents(from: UIViewController, api: SpaceAPI, session: BoardSession) { present(kind: .agents, from: from, api: api, session: session) }
     static func presentImports(from: UIViewController, api: SpaceAPI, session: BoardSession) { present(kind: .imports, from: from, api: api, session: session) }
 }
@@ -25,6 +25,7 @@ import UniformTypeIdentifiers
     let kind: SpacePanels.Kind; let api: SpaceAPI; let session: BoardSession
     var snapshot: SpaceSnapshot; var rows: [Row] = []; var history: [SpaceHistory] = []; var agents: [SpaceAgent] = []
     var onOpenPaper: ((String) -> Void)?
+    var onAddPaper: (() -> Void)?
     private var busy = false
     init(kind: SpacePanels.Kind, api: SpaceAPI, session: BoardSession, snapshot: SpaceSnapshot) {
         self.kind = kind; self.api = api; self.session = session; self.snapshot = snapshot; super.init(style: .plain)
@@ -35,9 +36,21 @@ import UniformTypeIdentifiers
         navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(close))
         navigationItem.leftBarButtonItem = UIBarButtonItem(barButtonSystemItem: .refresh, target: self, action: #selector(load))
         switch kind { case .settings: title = "Space settings"; case .history: title = "History"; case .papers: title = "Papers"; case .agents: title = "Agent access"; case .imports: title = "Add PDF" }
+        if kind == .papers {
+            tableView.accessibilityIdentifier = "board.papers-list"
+            if snapshot.space.member, onAddPaper != nil {
+                let add = UIBarButtonItem(barButtonSystemItem: .add, target: self, action: #selector(addPaper))
+                add.accessibilityLabel = "Add PDF"; add.accessibilityIdentifier = "board.papers-add"
+                navigationItem.leftBarButtonItem = add
+            }
+        }
         load()
     }
     @objc private func close() { dismiss(animated: true) }
+    @objc private func addPaper() {
+        guard snapshot.space.member, let onAddPaper else { return }
+        (navigationController ?? self).dismiss(animated: true, completion: onAddPaper)
+    }
     @objc private func load() {
         run {
             self.snapshot = try await self.api.space(id: self.snapshot.space.id)
@@ -69,12 +82,18 @@ import UniformTypeIdentifiers
             rows.append(Row(title: "Import arXiv") { [weak self] in self?.importURL(arxiv: true) })
             rows.append(Row(title: "Import PDF URL") { [weak self] in self?.importURL(arxiv: false) })
         }
+        if kind == .papers, rows.isEmpty {
+            let empty = UILabel(); empty.text = "No papers"; empty.textAlignment = .center; empty.font = .preferredFont(forTextStyle: .body)
+            tableView.backgroundView = empty
+        } else { tableView.backgroundView = nil }
         tableView.reloadData()
     }
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { rows.count }
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let row = rows[indexPath.row]; let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
-        cell.textLabel?.text = row.title; cell.detailTextLabel?.text = row.detail; cell.accessoryType = .disclosureIndicator; return cell
+        cell.textLabel?.text = row.title; cell.detailTextLabel?.text = row.detail; cell.accessoryType = .disclosureIndicator
+        if kind == .papers { cell.accessibilityIdentifier = "board.paper.\(snapshot.papers[indexPath.row].id)" }
+        return cell
     }
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) { tableView.deselectRow(at: indexPath, animated: true); guard !busy else { return }; rows[indexPath.row].action() }
     private func run(_ action: @escaping @MainActor () async throws -> Void) {
@@ -142,10 +161,28 @@ import UniformTypeIdentifiers
         confirm("Revoke \(agent.name)?") { [weak self] in self?.run { guard let self else { return }; try await self.api.revokeAgent(id: self.snapshot.space.id, agentID: agent.id); self.agents = try await self.api.agents(id: self.snapshot.space.id); self.rebuild() } }
     }
     private func paper(_ paper: PaperInfo) {
-        let alert = UIAlertController(title: paper.title, message: nil, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Open", style: .default) { [weak self] _ in guard let self else { return }; self.dismiss(animated: true) { self.onOpenPaper?(paper.id) } })
-        if snapshot.space.member { alert.addAction(UIAlertAction(title: paper.isRead == true ? "Mark unread" : "Mark read", style: .default) { [weak self] _ in self?.run { guard let self else { return }; try await self.api.markRead(paperID: paper.id, read: paper.isRead != true); self.snapshot = try await self.api.space(id: self.snapshot.space.id); self.rebuild() } }) }
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel)); present(alert, animated: true)
+        guard let onOpenPaper else { return }
+        // Dismiss the sheet itself before pushing the reader on the board's stack.
+        // An alert presented by this controller used to intercept dismiss().
+        let sheet = navigationController ?? self
+        sheet.dismiss(animated: true) { onOpenPaper(paper.id) }
+    }
+    override func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        guard kind == .papers, snapshot.space.member, indexPath.row < snapshot.papers.count else { return nil }
+        let paper = snapshot.papers[indexPath.row]
+        let action = UIContextualAction(style: .normal, title: paper.isRead == true ? "Mark unread" : "Mark read") { [weak self] _, _, completion in
+            guard let self, !self.busy else { completion(false); return }
+            self.run {
+                do {
+                    try await self.api.markRead(paperID: paper.id, read: paper.isRead != true)
+                    self.snapshot = try await self.api.space(id: self.snapshot.space.id)
+                    self.rebuild(); completion(true)
+                } catch { completion(false); throw error }
+            }
+        }
+        action.image = UIImage(systemName: paper.isRead == true ? "circle" : "checkmark.circle")
+        let configuration = UISwipeActionsConfiguration(actions: [action]); configuration.performsFirstActionWithFullSwipe = false
+        return configuration
     }
     private func importURL(arxiv: Bool) {
         guard snapshot.space.member else { return }

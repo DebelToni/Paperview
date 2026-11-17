@@ -10,6 +10,7 @@ import CSpaceEngine
     private(set) var board: BoardDocument
     private(set) var canUndo = false
     private(set) var canRedo = false
+    private(set) var contentGeneration: UInt64 = 0
 
     private struct Reply: Decodable {
         var ok: Bool
@@ -75,6 +76,7 @@ import CSpaceEngine
             throw BoardError.engine("Native engine returned incomplete document state.")
         }
         self.board = board; canUndo = undo; canRedo = redo
+        contentGeneration += 1
     }
     func replace(_ board: BoardDocument) throws { try accept(request("replace", ["board": Self.object(board)])) }
     @discardableResult func apply(_ command: BoardCommand) throws -> BoardDocument {

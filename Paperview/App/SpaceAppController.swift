@@ -29,6 +29,8 @@ enum NativeSpaceRoute: Equatable {
     private var pendingURL: URL?
     private var preparing = false
     private var openingPaper = false
+    private weak var openedReader: PaperReaderController?
+    private var openedRoute: PaperRoute?
     private let store = WKWebsiteDataStore.default().httpCookieStore
     private var applicationStorage: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -97,11 +99,16 @@ enum NativeSpaceRoute: Equatable {
         pushViewController(controller, animated: true)
     }
     private func openPaper(_ route: PaperRoute) {
-        guard !openingPaper else { return }; openingPaper = true
+        guard !openingPaper, !(topViewController === openedReader && openedRoute == route) else { return }
+        openingPaper = true
         freshAPI { [weak self] api in
-            guard let self else { return }; self.openingPaper = false
+            guard let self else { return }
             let reader = PaperReaderController(api: api, paperID: route.paperID, followID: route.followID, storageDirectory: self.applicationStorage.appendingPathComponent("ReaderSessions", isDirectory: true))
+            self.openedReader = reader; self.openedRoute = route
             self.pushViewController(reader, animated: true)
+            if let transition = self.transitionCoordinator {
+                transition.animate(alongsideTransition: nil) { [weak self] _ in self?.openingPaper = false }
+            } else { self.openingPaper = false }
         }
     }
     private func signIn(returnPath: String? = nil) {

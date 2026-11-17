@@ -9,6 +9,7 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
     private(set) var storageIdentity: String
     private var boundOwner: String?
     var nativeSpaceCache: SpaceSnapshot?
+    var nativeSpaceGeneration = 0
     private let cookies: [HTTPCookie]
     private let session: URLSession
     private let redirect = NoRedirect()

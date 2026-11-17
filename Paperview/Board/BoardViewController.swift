@@ -13,6 +13,9 @@ import ImageIO
     private(set) var engine: BoardEngine?
     private(set) var surface: BoardSurface?
     private var visuals: BoardVisualStore?
+    private var boardContextMenu: UIContextMenuInteraction?
+    private var visualGeneration: UInt64?
+    private var visualPapers: [PaperInfo] = []
     private var timer: Timer?
     private let strip = UIStackView()
     private let scroll = UIScrollView()
@@ -21,8 +24,20 @@ import ImageIO
     private var buttons: [BoardTool: UIButton] = [:]
     private let undoButton = UIButton(type: .system), redoButton = UIButton(type: .system)
     private let colorButton = UIButton(type: .system), widthButton = UIButton(type: .system), moreButton = UIButton(type: .system)
+    private let selectionButton = UIButton(type: .system)
+    private lazy var papersItem: UIBarButtonItem = {
+        let item = UIBarButtonItem(image: UIImage(systemName: "doc.on.doc"), style: .plain, target: self, action: #selector(showPapers))
+        item.accessibilityLabel = "Papers"; item.accessibilityIdentifier = "board.papers"
+        return item
+    }()
+    private lazy var openItem: UIBarButtonItem = {
+        let item = UIBarButtonItem(title: "Open PDF", style: .plain, target: self, action: #selector(openSelectedPaper))
+        item.accessibilityIdentifier = "board.open-paper"
+        return item
+    }()
     private var applying = false
     private var opening = false
+    private var contentPopWasEnabled: Bool?
     private struct PendingJournal {
         var document: BoardDocument
         var original: BoardDocument
@@ -37,6 +52,8 @@ import ImageIO
     private var pendingCreatedSelection: [String] = []
     private var quickEraseReturn: BoardTool?
     private var queuedErase = false
+    private var temporaryPanReturn: BoardTool?
+    private var restorePanAfterContact = false
     private var tool: BoardTool = .pen
     private var stroke = "#202124", fill = "transparent"
     private var width: Double = 2
@@ -53,7 +70,7 @@ import ImageIO
         view.backgroundColor = .white
         view.accessibilityIdentifier = "space.board"
         navigationItem.largeTitleDisplayMode = .never
-        navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "ellipsis.circle"), style: .plain, target: self, action: #selector(showMore))
+        navigationItem.rightBarButtonItem = papersItem
         configureStrip()
         status.textAlignment = .center; status.font = .systemFont(ofSize: 15); status.numberOfLines = 3
         status.accessibilityIdentifier = "board.status"; status.translatesAutoresizingMaskIntoConstraints = false
@@ -70,11 +87,21 @@ import ImageIO
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         navigationController?.setNavigationBarHidden(false, animated: animated)
+        if #available(iOS 26.0, *), let gesture = navigationController?.interactiveContentPopGestureRecognizer {
+            if contentPopWasEnabled == nil { contentPopWasEnabled = gesture.isEnabled }
+            // Horizontal canvas gestures must not become full-screen Back gestures.
+            gesture.isEnabled = false
+        }
         visuals?.resume(); startTimer(); changed()
+        if session.authorized, pendingJournal == nil { Task { await session.refresh() } }
     }
     override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); becomeFirstResponder() }
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        if #available(iOS 26.0, *), let enabled = contentPopWasEnabled {
+            navigationController?.interactiveContentPopGestureRecognizer?.isEnabled = enabled
+            contentPopWasEnabled = nil
+        }
         timer?.invalidate(); timer = nil; persistViewport(); visuals?.suspend()
         if session.authorized { do { try session.persist() } catch { show(error) } }
     }
@@ -122,8 +149,8 @@ import ImageIO
     private func changed() {
         guard isViewLoaded, !applying else { return }
         guard session.authorized, let snapshot = session.snapshot else {
-            surface?.cancelGesture(); surface?.removeFromSuperview(); surface = nil; engine = nil
-            visuals?.dispose(); visuals = nil
+            surface?.cancelGesture(); surface?.removeFromSuperview(); surface = nil; engine = nil; boardContextMenu = nil
+            visuals?.dispose(); visuals = nil; visualGeneration = nil; visualPapers = []
             presentedViewController?.dismiss(animated:false)
             status.isHidden = false; status.text = session.status; retry.isHidden = false; updateControls(); return
         }
@@ -138,22 +165,27 @@ import ImageIO
                 view.insertSubview(surface, at: 0)
                 NSLayoutConstraint.activate([surface.leadingAnchor.constraint(equalTo: view.leadingAnchor), surface.trailingAnchor.constraint(equalTo: view.trailingAnchor), surface.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor), surface.bottomAnchor.constraint(equalTo: scroll.topAnchor)])
                 let visuals = BoardVisualStore(api: api, session: session); self.visuals = visuals
-                visuals.onChange = { [weak self] in guard self?.surface?.isUsingTool == false else { return }; self?.surface?.setNeedsDisplay() }
+                visuals.onChange = { [weak self] in self?.surface?.invalidateVisuals() }
                 visuals.onError = { [weak self] error in self?.show(error) }
                 surface.visuals = visuals; surface.nativeStroke = { [weak self] in self?.session.nativeStroke(for: $0) }
                 surface.onCommand = { [weak self] command, native in self?.commit(command, native: native) ?? false }
+                surface.onUnconvertedInk = { [weak self] data, id in
+                    guard let self else { return false }
+                    do { try self.session.retainUnconvertedInk(data, id: id); return true }
+                    catch { self.show(error); return false }
+                }
                 surface.onSelection = { [weak self] _ in self?.updateControls() }
                 surface.onOpen = { [weak self] element in self?.openElement(element) }
                 surface.onError = { [weak self] error in self?.show(error) }
                 surface.onToolContactEnded = { [weak self] in self?.contactEnded() }
                 surface.onViewport = { [weak self] viewport in self?.viewportChanged(viewport) }
                 surface.addInteraction(UIDropInteraction(delegate: self))
-                surface.addInteraction(UIContextMenuInteraction(delegate: self))
+                boardContextMenu = UIContextMenuInteraction(delegate: self)
                 view.layoutIfNeeded()
                 if let viewport = loadViewport() { surface.setViewport(viewport) } else { surface.fit() }
                 surface.tool = tool; surface.strokeColor = stroke; surface.fillColor = fill; surface.strokeWidth = width
             } else if pendingJournal == nil, surface?.hasRetainedInk != true, engine?.board != session.board { try engine?.replace(session.board) }
-            visuals?.invalidate()
+            invalidateVisualsIfNeeded()
             surface?.papers = snapshot.papers
             surface?.editable = snapshot.space.member && pendingJournal == nil && surface?.hasRetainedInk != true && !session.hasUnconvertedInk && session.conflicts.isEmpty && !session.hasPendingIntent
             surface?.reload()
@@ -164,6 +196,12 @@ import ImageIO
             navigationItem.prompt = pendingJournal != nil ? "Edit retained in memory; retry local saving" : session.dirty || !session.conflicts.isEmpty ? session.status : nil
             updateControls()
         } catch { status.isHidden = false; status.text = error.localizedDescription; retry.isHidden = false; surface?.editable = false }
+    }
+    private func invalidateVisualsIfNeeded() {
+        guard let engine, let snapshot = session.snapshot,
+              visualGeneration != engine.contentGeneration || visualPapers != snapshot.papers else { return }
+        visuals?.invalidate()
+        visualGeneration = engine.contentGeneration; visualPapers = snapshot.papers
     }
     @discardableResult private func commit(_ command: BoardCommand, native: [String: Data] = [:], originalDocument: BoardDocument? = nil) -> Bool {
         guard let engine, session.snapshot?.space.member == true, session.conflicts.isEmpty, !session.hasPendingIntent, pendingJournal == nil, !session.hasUnconvertedInk || !native.isEmpty else { return false }
@@ -191,7 +229,7 @@ import ImageIO
                 let created = elements.filter { original.element($0.id) == nil && $0.kind != .pen }.map(\.id)
                 if !created.isEmpty { pendingCreatedSelection = created }
             }
-            applying = false; visuals?.invalidate(); surface?.reload(); updateControls()
+            applying = false; invalidateVisualsIfNeeded(); surface?.reload(); updateControls()
             if surface?.isUsingTool != true { selectCreatedObjects(); changed() }
             return true
         } catch {
@@ -227,6 +265,9 @@ import ImageIO
     }
     private func contactEnded() {
         selectCreatedObjects()
+        if restorePanAfterContact, let previous = temporaryPanReturn {
+            temporaryPanReturn = nil; restorePanAfterContact = false; selectTool(previous, explicit: false)
+        }
         if queuedErase { queuedErase = false; selectTool(.erase, explicit: false) }
         else if let previous = quickEraseReturn, tool == .erase { quickEraseReturn = nil; selectTool(previous, explicit: false) }
         changed()
@@ -245,8 +286,9 @@ import ImageIO
     private var center: BoardPoint { surface.map { $0.viewport.world(CGPoint(x: $0.bounds.midX, y: $0.bounds.midY)) } ?? BoardPoint(x: 0, y: 0) }
     private func nextZ() -> Double { (engine?.board.elements.map(\.z).max() ?? 0) + 1 }
     private func selectTool(_ value: BoardTool, explicit: Bool = true) {
+        if surface?.isEditingText == true, surface?.finishEditingText() != true { return }
         guard surface?.isUsingTool != true else { return }
-        if explicit { quickEraseReturn = nil; queuedErase = false }
+        if explicit { quickEraseReturn = nil; queuedErase = false; temporaryPanReturn = nil; restorePanAfterContact = false }
         tool = value
         if value != .select && value != .hand { surface?.select([]) }
         surface?.tool = value; updateControls()
@@ -256,7 +298,7 @@ import ImageIO
         scroll.backgroundColor = .white; scroll.accessibilityIdentifier = "board.toolbar"
         strip.axis = .horizontal; strip.spacing = 4; strip.alignment = .center; strip.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scroll); scroll.addSubview(strip)
-        NSLayoutConstraint.activate([scroll.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor), scroll.heightAnchor.constraint(equalToConstant: 54), strip.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8), strip.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8), strip.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor), strip.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor), strip.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)])
+        NSLayoutConstraint.activate([scroll.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor), scroll.heightAnchor.constraint(equalToConstant: 54), strip.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8), strip.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8), strip.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor), strip.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor), strip.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)])
         let values: [(BoardTool, String, String)] = [(.select,"cursorarrow","Select"),(.hand,"hand.draw","Pan"),(.rectangle,"rectangle","Rectangle"),(.arrow,"arrow.up.right","Arrow"),(.pen,"pencil.tip","Pen"),(.text,"textformat","Text"),(.erase,"eraser","Eraser")]
         for (value, symbol, label) in values {
             let button = makeButton(symbol, label: label, id: "board.tool.\(value.rawValue)") { [weak self] in self?.selectTool(value) }
@@ -273,7 +315,10 @@ import ImageIO
         colorButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] complete in Task { @MainActor in complete(self?.colorMenu().children ?? []) } }])
         widthButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] complete in Task { @MainActor in complete(self?.widthMenu().children ?? []) } }])
         moreButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] complete in Task { @MainActor in complete(self?.moreMenu().children ?? []) } }])
-        for button in [undoButton, redoButton, colorButton, widthButton, moreButton] { strip.addArrangedSubview(button) }
+        configure(selectionButton, symbol: "slider.horizontal.3", label: "Selection", id: "board.selection") { }
+        selectionButton.showsMenuAsPrimaryAction = true
+        selectionButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] complete in Task { @MainActor in complete(self?.selectionMenu().children ?? []) } }])
+        for button in [undoButton, redoButton, colorButton, widthButton, selectionButton, moreButton] { strip.addArrangedSubview(button) }
     }
     private func makeButton(_ symbol: String, label: String, id: String, action: @escaping () -> Void) -> UIButton {
         let result = UIButton(type: .system); configure(result, symbol: symbol, label: label, id: id, action: action); return result
@@ -285,6 +330,11 @@ import ImageIO
         button.layer.cornerRadius = 8
     }
     private func updateControls() {
+        if let surface, let menu = boardContextMenu {
+            let enabled = [.select, .hand, .pen].contains(tool) && !surface.isEditingText
+            if enabled, menu.view == nil { surface.addInteraction(menu) }
+            else if !enabled, menu.view != nil { surface.removeInteraction(menu) }
+        }
         let member = session.snapshot?.space.member == true && pendingJournal == nil && surface?.hasRetainedInk != true && !session.hasUnconvertedInk && session.conflicts.isEmpty && !session.hasPendingIntent
         for (value, button) in buttons {
             button.isSelected = tool == value; button.backgroundColor = tool == value ? UIColor.systemBlue.withAlphaComponent(0.12) : .clear
@@ -292,8 +342,14 @@ import ImageIO
         }
         undoButton.isEnabled = member && (engine?.canUndo ?? false); redoButton.isEnabled = member && (engine?.canRedo ?? false)
         colorButton.isEnabled = member; widthButton.isEnabled = member
-        colorButton.tintColor = BoardRenderer.color(surface?.editingTextElement?.stroke ?? selectedElements.first?.stroke ?? stroke)
-        widthButton.accessibilityValue = "\(selectedElements.first?.strokeWidth ?? width)"
+        let elements = selectedElements
+        selectionButton.isHidden = elements.isEmpty || surface?.isEditingText == true
+        let opensPaper = elements.count == 1 && elements[0].kind == .paper && elements[0].paperId != nil
+        let rightItems = opensPaper ? [papersItem, openItem] : [papersItem]
+        if navigationItem.rightBarButtonItems != rightItems { navigationItem.rightBarButtonItems = rightItems }
+        papersItem.isEnabled = session.authorized
+        colorButton.tintColor = BoardRenderer.color(surface?.editingTextElement?.stroke ?? elements.first?.stroke ?? stroke)
+        widthButton.accessibilityValue = "\(elements.first?.strokeWidth ?? width)"
     }
     private func colorMenu() -> UIMenu {
         let choices = [("Black","#202124"),("Red","#d5473f"),("Blue","#306dc4"),("Green","#358257"),("Purple","#9362b7"),("Transparent","transparent")]
@@ -335,8 +391,6 @@ import ImageIO
             groups.append(UIMenu(title: "Add", children: [action("Paste", "clipboard") { self.paste() }, action("Image, video or PDF…", "photo.on.rectangle") { self.chooseFile() }, action("Import PDF URL…", "link") { self.importURLPrompt() }, action("Add diagram…", "square.stack.3d.up") { self.addDiagram() }]))
         }
         if surface?.isEditingText == true { groups.append(textStyleMenu()) }
-        else if !selectedElements.isEmpty { groups.append(selectionMenu()) }
-        groups.append(action("Papers", "doc") { SpacePanels.presentPapers(from: self, api: self.api, session: self.session, onOpenPaper: self.onOpenPaper) })
         if editable {
             groups += [action("History", "clock.arrow.circlepath") { SpacePanels.presentHistory(from: self, api: self.api, session: self.session) }, action("Settings and invitation", "slider.horizontal.3") { SpacePanels.presentSettings(from: self, api: self.api, session: self.session) }, action("Agent access", "person.crop.square") { SpacePanels.presentAgents(from: self, api: self.api, session: self.session) }]
         } else if session.authorized {
@@ -424,14 +478,13 @@ import ImageIO
     private func action(_ title: String, _ symbol: String?, destructive: Bool = false, _ body: @escaping () -> Void) -> UIAction {
         UIAction(title: title, image: symbol.flatMap(UIImage.init(systemName:)), attributes: destructive ? .destructive : []) { _ in body() }
     }
-    @objc private func showMore() {
-        let controller = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
-        for (title, body) in [("Papers", { SpacePanels.presentPapers(from: self, api: self.api, session: self.session, onOpenPaper: self.onOpenPaper) }), ("Fit to content", { self.surface?.fit() }), ("Export board JSON", { self.exportDraft() })] {
-            controller.addAction(UIAlertAction(title: title, style: .default) { _ in body() })
-        }
-        if !session.conflicts.isEmpty || session.hasPendingIntent { controller.addAction(UIAlertAction(title: "Review conflicts", style: .default) { _ in self.reviewConflicts() }) }
-        controller.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        controller.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem; present(controller, animated: true)
+    @objc private func showPapers() {
+        SpacePanels.presentPapers(from: self, api: api, session: session, onOpenPaper: onOpenPaper, onAddPaper: { [weak self] in self?.chooseFile(onlyPDF: true) })
+    }
+    @objc private func openSelectedPaper() {
+        let elements = selectedElements
+        guard elements.count == 1, elements[0].kind == .paper else { return }
+        openElement(elements[0])
     }
     private func openElement(_ element: BoardElement?) {
         guard let element else { return }
@@ -478,7 +531,7 @@ import ImageIO
         guard session.authorized else { show(BoardError.notAuthorized); return }
         do {
             let document = pendingJournal?.document ?? engine?.board ?? session.board
-            let recovery = session.hasPendingIntent || session.hasUnconvertedInk || pendingJournal != nil || surface?.hasRetainedInk == true
+            let recovery = session.hasPendingIntent || session.hasPendingSubmission || session.hasUnconvertedInk || pendingJournal != nil || surface?.hasRetainedInk == true
             struct Recovery: Encodable {
                 let version = 1
                 var spaceID: String
@@ -528,6 +581,14 @@ import ImageIO
         alert.addAction(UIAlertAction(title: "OK", style: .default)); present(alert, animated: true)
     }
     private func run(_ action: @escaping @MainActor () async throws -> Void) { Task { do { try await action(); changed() } catch { show(error) } } }
+    private func runImport(_ action: @escaping @MainActor () async throws -> Void) {
+        guard !importBusy else { show(BoardError.invalidDocument("An import is already in progress.")); return }
+        importBusy = true
+        Task {
+            defer { importBusy = false }
+            do { try await action(); changed() } catch { show(error) }
+        }
+    }
     private func textPrompt(_ title: String, value: String = "", action: @escaping (String) -> Void) {
         let alert = UIAlertController(title: title, message: nil, preferredStyle: .alert)
         alert.addTextField { field in field.text = value; field.autocorrectionType = .no; field.spellCheckingType = .no; field.autocapitalizationType = .none; field.inlinePredictionType = .no }
@@ -542,17 +603,56 @@ import ImageIO
         self.changeStyle { if fill { $0.fill = text } else { $0.stroke = text } }; self.updateControls()
     } }
     func contextMenuInteraction(_ interaction: UIContextMenuInteraction, configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
-        guard let surface, let engine, !surface.isUsingTool else { return nil }
-        do { if let id = try engine.hit(surface.viewport.world(location), tolerance: 8 / surface.viewport.zoom) { surface.select([id]) } }
+        guard let surface, let engine, surface.prepareContextMenu() else { return nil }
+        do { surface.select(try engine.hit(surface.viewport.world(location), tolerance: 8 / surface.viewport.zoom).map { [$0] } ?? []) }
         catch { show(error); return nil }
-        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in self.moreMenu() }
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in
+            let selection = self.selectedElements.isEmpty ? [] : self.selectionMenu().children
+            return UIMenu(children: selection + self.moreMenu().children)
+        }
+    }
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willDisplayMenuFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
+        if surface?.prepareContextMenu() == true { surface?.cancelGesture() }
     }
     override var keyCommands: [UIKeyCommand]? {
         guard presentedViewController == nil else { return [] }
         if surface?.isEditingText == true { return [UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(cancelInlineText))] }
-        let commands: [(String, UIKeyModifierFlags, Selector)] = [("z",.command,#selector(undoKey)),("z",[.command,.shift],#selector(redoKey)),("g",.command,#selector(groupKey)),("g",[.command,.shift],#selector(ungroupKey)),("v",.command,#selector(pasteKey)),("a",.command,#selector(selectAllKey)),("+",.command,#selector(zoomInKey)),("-",.command,#selector(zoomOutKey)),("0",.command,#selector(resetZoomKey)),("\u{8}",[],#selector(deleteKey)),("f",[],#selector(fitKey))]
-        return commands.map { UIKeyCommand(input: $0.0, modifierFlags: $0.1, action: $0.2) } + ["1","2","3","4","5","6","v","r","a","p","t","e"].map { UIKeyCommand(input: $0, modifierFlags: [], action: #selector(toolKey(_:))) }
+        let commands: [(String, UIKeyModifierFlags, Selector, String)] = [
+            ("z", .command, #selector(undoKey), "Undo"), ("z", [.command,.shift], #selector(redoKey), "Redo"),
+            ("g", .command, #selector(groupKey), "Group"), ("g", [.command,.shift], #selector(ungroupKey), "Ungroup"),
+            ("v", .command, #selector(pasteKey), "Paste"), ("a", .command, #selector(selectAllKey), "Select all"),
+            ("+", .command, #selector(zoomInKey), "Zoom in"), ("-", .command, #selector(zoomOutKey), "Zoom out"),
+            ("0", .command, #selector(resetZoomKey), "Reset zoom"), ("\u{8}", [], #selector(deleteKey), "Delete selection"),
+            ("f", [], #selector(fitKey), "Fit to content"), (UIKeyCommand.inputEscape, [], #selector(clearSelectionKey), "Select tool"),
+            ("=", [], #selector(zoomInKey), "Zoom in"), ("+", [], #selector(zoomInKey), "Zoom in"), ("-", [], #selector(zoomOutKey), "Zoom out")]
+        return commands.map { item in
+            let command = UIKeyCommand(input: item.0, modifierFlags: item.1, action: item.2)
+            command.discoverabilityTitle = item.3; return command
+        } + ["1","2","3","4","5","6","v","r","a","p","t","e"].map { UIKeyCommand(input: $0, modifierFlags: [], action: #selector(toolKey(_:))) }
     }
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if presentedViewController == nil, surface?.isEditingText != true, surface?.isUsingTool == false,
+           presses.contains(where: { $0.key?.charactersIgnoringModifiers == " " && $0.key?.modifierFlags.isEmpty == true }) {
+            if temporaryPanReturn == nil { temporaryPanReturn = tool; selectTool(.hand, explicit: false) }
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if temporaryPanReturn != nil, presses.contains(where: { $0.key?.charactersIgnoringModifiers == " " }) {
+            endTemporaryPan(); return
+        }
+        super.pressesEnded(presses, with: event)
+    }
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        endTemporaryPan(); super.pressesCancelled(presses, with: event)
+    }
+    private func endTemporaryPan() {
+        guard let previous = temporaryPanReturn else { return }
+        if surface?.isUsingTool == true { restorePanAfterContact = true }
+        else { temporaryPanReturn = nil; restorePanAfterContact = false; selectTool(previous, explicit: false) }
+    }
+    @objc private func clearSelectionKey() { surface?.cancelGesture(); selectTool(.select); surface?.select([]) }
     @objc private func cancelInlineText() { surface?.cancelGesture() }
     @objc private func undoKey() { history() }
     @objc private func redoKey() { history(redo: true) }
@@ -570,14 +670,14 @@ import ImageIO
         if let input = command.input, let tool = tools[input] { selectTool(tool) }
     }
 
-    private func chooseFile() {
+    private func chooseFile(onlyPDF: Bool = false) {
         guard session.snapshot?.space.member == true, !importBusy else { return }
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.image,.movie,.pdf], asCopy: true)
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: onlyPDF ? [.pdf] : [.image,.movie,.pdf], asCopy: true)
         picker.allowsMultipleSelection = true; picker.delegate = self; present(picker, animated: true)
     }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         let point = center
-        run {
+        runImport {
             for (index, url) in urls.enumerated() {
                 let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
                 let values = try url.resourceValues(forKeys: [.fileSizeKey,.contentTypeKey])
@@ -590,8 +690,7 @@ import ImageIO
         }
     }
     private func importData(_ data: Data, type: UTType, filename: String, at point: BoardPoint) async throws {
-        guard session.snapshot?.space.member == true, session.conflicts.isEmpty, !importBusy, pendingJournal == nil else { throw BoardError.invalidDocument("Resolve pending board edits before importing.") }
-        importBusy = true; defer { importBusy = false }
+        guard session.snapshot?.space.member == true, session.conflicts.isEmpty, pendingJournal == nil else { throw BoardError.invalidDocument("Resolve pending board edits before importing.") }
         if type.conforms(to: .pdf) {
             guard data.count <= 40 * 1024 * 1024 else { throw PaperError.oversized }
             let result = try await api.uploadPDF(id: session.spaceID, data: data, filename: filename)
@@ -603,7 +702,7 @@ import ImageIO
             let assetId = UUID().uuidString
             var element = BoardElement(kind: .image); element.assetId = assetId; element.videoAutoplay = result.autoplay
             element.x = point.x; element.y = point.y; element.width = result.width * scale; element.height = result.height * scale; element.z = nextZ()
-            commit(.put([element], assets: [assetId:result.asset]))
+            guard commit(.put([element], assets: [assetId:result.asset])) else { throw BoardError.journal("Media import needs attention. Resolve retained edits and retry local saving before importing again.") }
         } else if type.conforms(to: .image) {
             guard data.count <= 16 * 1024 * 1024 else { throw PaperError.oversized }
             guard let source = CGImageSourceCreateWithData(data as CFData,nil),
@@ -616,7 +715,7 @@ import ImageIO
             let assetId = UUID().uuidString, scale = min(1,640/image.size.width,480/image.size.height)
             var element = BoardElement(kind:.image); element.assetId = assetId
             element.x = point.x; element.y = point.y; element.width = Double(image.size.width * scale); element.height = Double(image.size.height * scale); element.z = nextZ()
-            commit(.put([element],assets:[assetId:BoardAsset(mimeType:"image/png",dataURL:"data:image/png;base64," + png.base64EncodedString())]))
+            guard commit(.put([element],assets:[assetId:BoardAsset(mimeType:"image/png",dataURL:"data:image/png;base64," + png.base64EncodedString())])) else { throw BoardError.journal("Image import needs attention. Resolve retained edits and retry local saving before importing again.") }
         } else { throw BoardError.invalidDocument("Use an image, video or PDF.") }
     }
     private func openLink(_ url: URL) {
@@ -632,13 +731,13 @@ import ImageIO
         }
         element.x = point.x - 180; element.y = point.y - 140; element.width = 360; element.height = 280
         element.stroke = "#c4c9d2"; element.fill = "#f6f7f9"; element.z = nextZ()
-        commit(.put([element]))
+        guard commit(.put([element])) else { throw BoardError.journal("PDF imported and kept in Papers. Resolve retained board edits and retry local saving before adding another card.") }
     }
     private func paste() {
         guard session.snapshot?.space.member == true, !importBusy, surface?.isUsingTool == false else { return }
         let pasteboard = UIPasteboard.general, point = center
         if let images = pasteboard.images, !images.isEmpty {
-            run {
+            runImport {
                 for (index,image) in images.enumerated() {
                     guard let data = image.pngData() else { throw BoardError.invalidDocument("Clipboard image cannot be decoded.") }
                     try await self.importData(data,type:.png,filename:"clipboard.png",at:BoardPoint(x:point.x + Double(index)*24,y:point.y + Double(index)*24))
@@ -647,34 +746,36 @@ import ImageIO
         } else if let text = pasteboard.string, !text.isEmpty { pasteText(text, at:point) }
     }
     private func pasteText(_ text: String, at point: BoardPoint) {
-        guard text.count <= 100000 else { show(BoardError.invalidDocument("Pasted text exceeds 100,000 characters.")); return }
+        runImport { try await self.importText(text, at: point) }
+    }
+    private func importText(_ text: String, at point: BoardPoint) async throws {
+        guard text.count <= 100000 else { throw BoardError.invalidDocument("Pasted text exceeds 100,000 characters.") }
         let source = text.trimmingCharacters(in:.whitespacesAndNewlines)
         if BoardURLImports.isYouTube(source) {
-            run {
-                do {
-                    let preview = try await self.api.youtubePreview(url: source)
-                    guard self.session.authorized, self.session.snapshot?.space.member == true else { throw BoardError.notAuthorized }
-                    let asset = UUID().uuidString
-                    var element = BoardElement(kind: .image); element.assetId = asset; element.url = preview.url; element.text = preview.title
-                    element.x = point.x; element.y = point.y; element.width = 360; element.height = 247; element.z = self.nextZ()
-                    self.commit(.put([element], assets: [asset: preview.thumbnail]))
-                } catch {
-                    if (error as? PaperError)?.deniesAccess == true { self.session.invalidateAccess(); throw error }
-                    self.addText(text, at: point)
-                    throw BoardError.invalidDocument("YouTube preview unavailable. The link was kept: \(error.localizedDescription)")
-                }
+            let preview: BoardYouTubePreview
+            do { preview = try await api.youtubePreview(url: source) }
+            catch {
+                if (error as? PaperError)?.deniesAccess == true { session.invalidateAccess(); throw error }
+                try addText(text, at: point)
+                throw BoardError.invalidDocument("YouTube preview unavailable. The link was kept: \(error.localizedDescription)")
             }
+            guard session.authorized, session.snapshot?.space.member == true else { throw BoardError.notAuthorized }
+            let asset = UUID().uuidString
+            var element = BoardElement(kind: .image); element.assetId = asset; element.url = preview.url; element.text = preview.title
+            element.x = point.x; element.y = point.y; element.width = 360; element.height = 247; element.z = nextZ()
+            guard commit(.put([element], assets: [asset: preview.thumbnail])) else { throw BoardError.journal("Preview import needs attention. Resolve retained edits and retry local saving before importing again.") }
             return
         }
         if let url = URL(string:source), ["http","https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil {
             let arxiv = ["arxiv.org","www.arxiv.org"].contains(url.host?.lowercased() ?? "")
             if arxiv || url.path.lowercased().hasSuffix(".pdf") {
-                run { let result = try await self.api.importPaper(id:self.session.spaceID,url:source,arxiv:arxiv); await self.session.refresh(); try self.addPaper(result.paper,at:point,sourceURL:source) }; return
+                let result = try await api.importPaper(id: session.spaceID, url: source, arxiv: arxiv)
+                await session.refresh(); try addPaper(result.paper, at: point, sourceURL: source); return
             }
         }
-        addText(text,at:point)
+        try addText(text, at: point)
     }
-    private func addText(_ text: String, at point: BoardPoint) {
+    private func addText(_ text: String, at point: BoardPoint) throws {
         var element = BoardElement(kind:.text); element.x = point.x; element.y = point.y; element.text = text
         element.stroke = stroke; element.fontFamily = "sans-serif"; element.autoFontSize = true; element.textWrapWidth = 0
         let words = text.split(whereSeparator:\.isWhitespace).count; element.fontSize = words >= 1000 ? 14 : words >= 100 ? 18 : 24
@@ -682,10 +783,11 @@ import ImageIO
         if let url = safeExternal(text.trimmingCharacters(in:.whitespacesAndNewlines)), !text.contains(where:\.isWhitespace) { element.url = url.absoluteString }
         if let size = visuals?.measureText(for:element,constrainedTo:1e7) { element.width = max(12,Double(size.width)); element.height = Double(size.height) }
         else { element.width = 240; element.height = element.fontSize! * 1.3 }
-        commit(.put([element])); surface?.select([element.id])
+        guard commit(.put([element])) else { throw BoardError.journal("Text import needs attention. Resolve retained edits and retry local saving before pasting again.") }
+        surface?.select([element.id])
     }
     private func importURLPrompt() {
-        textPrompt("PDF URL") { url in let point = self.center; self.run {
+        textPrompt("PDF URL") { url in let point = self.center; self.runImport {
             guard let parsed = URL(string:url), ["http","https"].contains(parsed.scheme?.lowercased() ?? "") else { throw PaperError.invalidURL }
             let arxiv = ["arxiv.org","www.arxiv.org"].contains(parsed.host?.lowercased() ?? "")
             let result = try await self.api.importPaper(id:self.session.spaceID,url:url,arxiv:arxiv); await self.session.refresh(); try self.addPaper(result.paper,at:point,sourceURL:url)
@@ -713,32 +815,41 @@ import ImageIO
     }
     func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal { UIDropProposal(operation:.copy) }
     func dropInteraction(_ interaction: UIDropInteraction, performDrop drop: UIDropSession) {
-        guard let surface else { return }; let point = surface.viewport.world(drop.location(in:surface))
-        for item in drop.items {
-            let provider = item.itemProvider
-            if provider.canLoadObject(ofClass:NSString.self) && !provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) && !provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
-                provider.loadObject(ofClass:NSString.self) { [weak self] value,error in
-                    Task { @MainActor in if let error { self?.show(error) } else if let value = value as? String { self?.pasteText(value,at:point) } }
-                }
-            } else if let identifier = provider.registeredTypeIdentifiers.first(where:{ id in UTType(id).map { $0.conforms(to:.image) || $0.conforms(to:.movie) || $0.conforms(to:.pdf) } ?? false }) {
-                provider.loadFileRepresentation(forTypeIdentifier:identifier) { [weak self] url,error in
-                    let loaded: Result<Data,Error> = Result {
-                        guard let url, let type = UTType(identifier) else { throw error ?? PaperError.invalidResponse }
-                        let limit = type.conforms(to:.pdf) ? 40*1024*1024 : 16*1024*1024
-                        let handle = try FileHandle(forReadingFrom:url); defer { try? handle.close() }
-                        let data = try handle.read(upToCount:limit+1) ?? Data()
-                        guard data.count <= limit else { throw PaperError.oversized }
-                        return data
-                    }
-                    Task { @MainActor in
-                        guard let self, let type = UTType(identifier) else { return }
-                        switch loaded {
-                        case let .failure(error): self.show(error)
-                        case let .success(data): self.run { try await self.importData(data,type:type,filename:provider.suggestedName ?? "upload",at:point) }
+        guard let surface else { return }
+        let point = surface.viewport.world(drop.location(in: surface))
+        let providers = drop.items.map(\.itemProvider)
+        runImport {
+            var failures: [String] = []
+            for (index, provider) in providers.enumerated() {
+                do {
+                let target = BoardPoint(x: point.x + Double(index) * 24, y: point.y + Double(index) * 24)
+                if provider.canLoadObject(ofClass: NSString.self) && !provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) && !provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
+                    let text: String = try await withCheckedThrowingContinuation { continuation in
+                        provider.loadObject(ofClass: NSString.self) { value, error in
+                            if let error { continuation.resume(throwing: error) }
+                            else if let text = value as? String { continuation.resume(returning: text) }
+                            else { continuation.resume(throwing: PaperError.invalidResponse) }
                         }
                     }
-                }
+                    try await self.importText(text, at: target)
+                } else if let identifier = provider.registeredTypeIdentifiers.first(where: { id in UTType(id).map { $0.conforms(to: .image) || $0.conforms(to: .movie) || $0.conforms(to: .pdf) } ?? false }), let type = UTType(identifier) {
+                    let data: Data = try await withCheckedThrowingContinuation { continuation in
+                        provider.loadFileRepresentation(forTypeIdentifier: identifier) { url, error in
+                            continuation.resume(with: Result {
+                                guard let url else { throw error ?? PaperError.invalidResponse }
+                                let limit = type.conforms(to: .pdf) ? 40 * 1024 * 1024 : 16 * 1024 * 1024
+                                let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
+                                let data = try handle.read(upToCount: limit + 1) ?? Data()
+                                guard data.count <= limit else { throw PaperError.oversized }
+                                return data
+                            })
+                        }
+                    }
+                    try await self.importData(data, type: type, filename: provider.suggestedName ?? "upload", at: target)
+                } else { throw BoardError.invalidDocument("The dropped item is not an image, video, PDF or text.") }
+                } catch { failures.append("Item \(index + 1): \(error.localizedDescription)") }
             }
+            if !failures.isEmpty { throw BoardError.invalidDocument(failures.joined(separator: "\n")) }
         }
     }
 }

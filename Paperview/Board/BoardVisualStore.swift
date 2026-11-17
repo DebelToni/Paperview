@@ -17,8 +17,8 @@ import CoreImage
             }
         }
     }
-    static let pixelBudget = 24_000_000
-    static let sourceBudget = 64 * 1024 * 1024
+    nonisolated static let pixelBudget = 24_000_000
+    nonisolated static let sourceBudget = 64 * 1024 * 1024
     private let api: SpaceAPI
     private let session: BoardSession
     var onChange: (() -> Void)?
@@ -31,10 +31,14 @@ import CoreImage
     private var failures = Set<String>()
     private var reserved: [String: Int] = [:]
     private var videoFiles: [String: (url: URL, bytes: Int)] = [:]
-    private struct Raster { var image: UIImage; var pixels: Int; var used: TimeInterval }
+    private struct Raster { var image: UIImage; var pixels: Int; var used: TimeInterval; var source: String }
     private var rasters: [String: Raster] = [:]
     private var papers: [String: (data: Data, count: Int)] = [:]
-    private var text: [String: (element: BoardElement, width: CGFloat, layout: BoardTextLayout, used: TimeInterval)] = [:]
+    private var text: [String: (signature: BoardTextLayout.Signature, width: CGFloat, layout: BoardTextLayout, used: TimeInterval)] = [:]
+    private var paperIndex: [String: PaperInfo] = [:]
+    private var latestPaperRaster: [String: String] = [:]
+    private(set) var documentIndexCount = 0
+    private(set) var textLayoutCount = 0
     private struct Movie { var elementID: String; var url: URL; var generator: AVAssetImageGenerator; var player: AVPlayer; var output: AVPlayerItemVideoOutput; var size: CGSize; var start: TimeInterval; var seen: TimeInterval }
     private var movies: [String: Movie] = [:]
     private var gifs: [String: (source: CGImageSource, frame: Int, next: TimeInterval, seen: TimeInterval, bytes: Int)] = [:]
@@ -61,6 +65,7 @@ import CoreImage
         stopDecoders()
         papers.removeAll(); rasters.removeAll(); text.removeAll(); failures.removeAll()
         videoFiles.removeAll(); elements.removeAll(); fingerprints.removeAll(); paperRevisions.removeAll()
+        paperIndex.removeAll(); latestPaperRaster.removeAll()
         if let directory { try? FileManager.default.removeItem(at: directory) }; directory = nil
         revision = nil
     }
@@ -69,7 +74,9 @@ import CoreImage
         // The journal's authorized local composition includes completed unsaved edits.
         let document = session.board
         elements = Dictionary(document.elements.filter { !$0.deleted }.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
-        let paperIDs = Set(snapshot.papers.map { $0.id })
+        documentIndexCount += 1
+        paperIndex = Dictionary(snapshot.papers.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        let paperIDs = Set(paperIndex.keys)
         papers = papers.filter { paperIDs.contains($0.key) }
         let assets = document.assets
         fingerprints = fingerprints.filter { assets[$0.key] != nil }
@@ -92,9 +99,12 @@ import CoreImage
             movie.player.pause(); movie.generator.cancelAllCGImageGeneration(); movies.removeValue(forKey: key)
         }
         gifs = gifs.filter { valid.contains($0.key) }
-        rasters = rasters.filter { entry in valid.contains(where: { entry.key == $0 || entry.key.hasPrefix($0 + ":") }) }
+        rasters = rasters.filter { valid.contains($0.value.source) }
+        paperRevisions = paperRevisions.filter { rasters[$0.key] != nil }
+        latestPaperRaster = latestPaperRaster.filter { valid.contains($0.key) && rasters[$0.value] != nil }
         revision = snapshot.space.revision
-        text = text.filter { elements[$0.key] == $0.value.element }
+        // Moving/reordering/version bumps cannot change glyph layout.
+        text = text.filter { entry in elements[entry.key].map { BoardTextLayout.Signature($0) == entry.value.signature } == true }
     }
     func suspend() {
         stopped = true; generation += 1
@@ -107,7 +117,13 @@ import CoreImage
     private func checkAccess() -> Bool {
         guard !disposed, session.authorized, session.snapshot != nil else { clearContent(); return false }
         guard !stopped else { return false }
-        if revision != session.snapshot?.space.revision { invalidate() }
+        if revision == nil { invalidate() }
+        else if revision != session.snapshot?.space.revision {
+            // Metadata/annotation freshness is independent of the active board.
+            // The controller explicitly invalidates on document composition changes.
+            revision = session.snapshot?.space.revision
+            paperIndex = Dictionary((session.snapshot?.papers ?? []).map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        }
         return true
     }
     private func sourceKey(_ e: BoardElement) -> String {
@@ -125,7 +141,7 @@ import CoreImage
     }
     func paperInfo(for element: BoardElement) -> PaperInfo? {
         guard checkAccess(), let id = element.paperId else { return nil }
-        return session.snapshot?.papers.first { $0.id == id }
+        return paperIndex[id]
     }
     private func report(_ error: Error, key: String) { if failures.insert(key).inserted { onError?(error) } }
     private func reserve(_ pixels: Int, preserving: String? = nil) throws {
@@ -136,9 +152,9 @@ import CoreImage
             rasters.removeValue(forKey: oldest)
         }
     }
-    private func put(_ image: UIImage, key: String) {
+    private func put(_ image: UIImage, key: String, source: String? = nil) {
         guard let cg = image.cgImage else { return }
-        rasters[key] = Raster(image: image, pixels: cg.width * cg.height, used: now)
+        rasters[key] = Raster(image: image, pixels: cg.width * cg.height, used: now, source: source ?? key)
     }
     static func dimensions(_ size: CGSize) throws -> CGSize {
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { throw Failure.invalidMedia }
@@ -146,19 +162,31 @@ import CoreImage
         guard w <= 8192, h <= 8192, w * h <= Double(Self.pixelBudget / 2) else { throw Failure.oversized }
         return CGSize(width: w, height: h)
     }
+    static func previewSize(_ target: CGSize) throws -> CGSize {
+        guard target.width.isFinite, target.height.isFinite, target.width > 0, target.height > 0 else { throw Failure.invalidMedia }
+        let longest = max(target.width, target.height)
+        let bucket = pow(2, ceil(log2(max(128, longest)) * 2) / 2)
+        // Resolution is bounded; the original remains intact even at extreme zoom.
+        let scale = min(bucket / longest, 8192 / longest, sqrt(6_000_000 / (target.width * target.height)))
+        return try dimensions(CGSize(width: max(1, floor(target.width * scale + 1e-8)), height: max(1, floor(target.height * scale + 1e-8))))
+    }
     func preview(for element: BoardElement, asset: BoardAsset?, targetSize: CGSize) -> UIImage? {
         guard checkAccess(), matches(element) else { return nil }
         if let id = element.assetId, asset != fingerprints[id]?.asset { return nil }
         let key = sourceKey(element)
         do {
-            let size = try Self.dimensions(targetSize)
+            let size = try Self.previewSize(targetSize)
             if element.kind == .paper {
                 guard element.paperView == "page", let id = element.paperId,
-                      session.snapshot?.papers.contains(where: { $0.id == id }) == true else { return nil }
+                      paperIndex[id] != nil else { return nil }
                 let rasterKey = key + ":\(Int(size.width))x\(Int(size.height))"
                 if paperRevisions[rasterKey] == revision, var cached = rasters[rasterKey] { cached.used = now; rasters[rasterKey] = cached; return cached.image }
-                if tasks[key] == nil && !failures.contains(key) { loadPaper(element, key: key, rasterKey: rasterKey, size: size) }
-                return rasters[rasterKey]?.image
+                if tasks[key] == nil && tasks.count < 2 && !failures.contains(key) { loadPaper(element, key: key, rasterKey: rasterKey, size: size) }
+                if var cached = rasters[rasterKey] { cached.used = now; rasters[rasterKey] = cached; return cached.image }
+                if let previous = latestPaperRaster[key], var cached = rasters[previous] {
+                    cached.used = now; rasters[previous] = cached; return cached.image
+                }
+                return nil
             }
             guard let id = element.assetId, let asset = fingerprints[id]?.asset else { return nil }
             if asset.mimeType == "video/mp4" {
@@ -195,7 +223,7 @@ import CoreImage
         let renderRevision = revision
         tasks[key] = Task { [weak self] in
             guard let self, let id = e.paperId else { return }
-            defer { if token == self.generation { self.tasks.removeValue(forKey: key) } }
+            defer { if token == self.generation { self.tasks.removeValue(forKey: key); self.onChange?() } }
             do {
                 let metadata = try await api.metadata(paperID: id)
                 guard current(e, key: key, token: token), metadata.paper.spaceID == session.spaceID else { return }
@@ -220,20 +248,25 @@ import CoreImage
                 }
                 guard current(e, key: key, token: token) else { return }
                 guard revision == renderRevision else { return }
-                put(image, key: rasterKey); paperRevisions[rasterKey] = renderRevision; onChange?()
+                // Keep one useful resolution per source instead of every pinch sample.
+                if let old = latestPaperRaster[key], old != rasterKey {
+                    rasters.removeValue(forKey: old); paperRevisions.removeValue(forKey: old)
+                }
+                put(image, key: rasterKey, source: key); latestPaperRaster[key] = rasterKey
+                paperRevisions[rasterKey] = renderRevision; onChange?()
             } catch { if current(e, key: key, token: token) { report(error, key: key) } }
         }
     }
     func pdfPageCount(for element: BoardElement) -> Int? {
         guard checkAccess(), matches(element), let id = element.paperId,
-              session.snapshot?.papers.contains(where: { $0.id == id }) == true else { return nil }
+              paperIndex[id] != nil else { return nil }
         if let count = papers[id]?.count { return count }
         let key = sourceKey(element)
         if tasks[key] == nil && !failures.contains(key) { loadPaper(element, key: key, rasterKey: key + ":menu", size: CGSize(width: 256, height: 256)) }
         return nil
     }
 
-    static func embedded(_ asset: BoardAsset, mime: String) throws -> Data {
+    nonisolated static func embedded(_ asset: BoardAsset, mime: String) throws -> Data {
         guard asset.mimeType == mime, asset.dataURL.hasPrefix("data:\(mime);base64,"),
               asset.dataURL.utf8.count <= (sourceBudget * 4 / 3 + 128),
               let comma = asset.dataURL.firstIndex(of: ","),
@@ -331,10 +364,19 @@ import CoreImage
         if movies.isEmpty && gifs.isEmpty { timer?.invalidate(); timer = nil }
     }
     private func layout(_ e: BoardElement, width: CGFloat) throws -> BoardTextLayout {
-        if var cached = text[e.id], cached.element == e, cached.width == width { cached.used = now; text[e.id] = cached; return cached.layout }
-        let value = try BoardTextLayout(element: e, width: width)
-        if text.count >= 64, let oldest = text.min(by: { $0.value.used < $1.value.used })?.key { text.removeValue(forKey: oldest) }
-        text[e.id] = (e, width, value, now); return value
+        let signature = BoardTextLayout.Signature(e)
+        if var cached = text[e.id], cached.signature == signature, cached.width == width {
+            cached.used = now; text[e.id] = cached; return cached.layout
+        }
+        let value = try BoardTextLayout(element: e, width: width); textLayoutCount += 1
+        text.removeValue(forKey: e.id)
+        var cost = text.values.reduce(0) { $0 + $1.layout.estimatedCost }
+        while cost + value.estimatedCost > 16 * 1024 * 1024,
+              let oldest = text.min(by: { $0.value.used < $1.value.used })?.key {
+            cost -= text.removeValue(forKey: oldest)!.layout.estimatedCost
+        }
+        if value.estimatedCost <= 16 * 1024 * 1024 { text[e.id] = (signature, width, value, now) }
+        return value
     }
     func measureText(for element: BoardElement, constrainedTo width: Double) -> CGSize? {
         guard checkAccess() else { return nil }

@@ -186,4 +186,190 @@ import PencilKit
         XCTAssertEqual(edited.width, shape.width); XCTAssertEqual(edited.height, shape.height); XCTAssertEqual(edited.text, "")
     }
 
+    func testViewportFramesReuseBoundedQueryAndRefreshNewlyExposedContent() throws {
+        var distant = BoardElement(kind: .rectangle, id: "distant")
+        distant.x = 1200; distant.y = 280; distant.width = 40; distant.height = 40
+        distant.fill = "#ff0000"; distant.stroke = "transparent"
+        let engine = try engine([distant]), surface = BoardSurface(engine: engine)
+        surface.frame = CGRect(x: 0, y: 0, width: 800, height: 600); surface.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        func frame() -> UIImage {
+            UIGraphicsImageRenderer(size: surface.bounds.size, format: format).image { output in
+                UIColor.white.setFill(); output.fill(surface.bounds); surface.draw(surface.bounds)
+            }
+        }
+        _ = frame()
+        let initial = surface.viewportQueryCount
+        for x in 1...60 { surface.setViewport(BoardViewport(x: Double(x), y: 0, zoom: 1)); surface.reload(); _ = frame() }
+        XCTAssertEqual(surface.viewportQueryCount, initial, "Small pans reuse world-space items, not JSON for every sample")
+        XCTAssertEqual(surface.documentIndexCount, 1)
+        XCTAssertEqual(surface.selectionBoundsCount, 0, "Empty selection must never issue document bounds")
+        surface.setViewport(BoardViewport(x: -600, y: 0, zoom: 1))
+        let image = frame()
+        XCTAssertEqual(surface.viewportQueryCount, initial + 1)
+        let cg = try XCTUnwrap(image.cgImage)
+        var bytes = [UInt8](repeating: 0, count: 800 * 600 * 4)
+        let c = try XCTUnwrap(CGContext(data: &bytes, width: 800, height: 600, bitsPerComponent: 8, bytesPerRow: 800 * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        c.draw(cg, in: surface.bounds)
+        let pixel = (300 * 800 + 620) * 4
+        XCTAssertGreaterThan(bytes[pixel], 240); XCTAssertLessThan(bytes[pixel + 1], 20)
+        var added = distant; added.id = "new"; added.x = 900
+        try engine.apply(.put([added])); surface.reload(); surface.prepareFrame()
+        XCTAssertEqual(surface.documentIndexCount, 2)
+        XCTAssertEqual(surface.viewportQueryCount, initial + 2, "A document change invalidates even a contained query")
+    }
+
+    func testPrefetchAtNegativeWorldLimitStillPaintsVisibleContent() throws {
+        var element = BoardElement(kind: .rectangle, id: "world-edge")
+        element.x = -10_000_000; element.y = -10_000_000; element.width = 100; element.height = 100
+        element.fill = "#ff0000"; element.stroke = "transparent"
+        let surface = BoardSurface(engine: try engine([element]))
+        surface.frame = CGRect(x: 0, y: 0, width: 200, height: 200); surface.layoutIfNeeded()
+        surface.onError = { XCTFail("Valid edge-of-world query failed: \($0)") }
+        surface.setViewport(BoardViewport(x: 10_000_000, y: 10_000_000, zoom: 1))
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: surface.bounds.size, format: format).image { output in
+            UIColor.white.setFill(); output.fill(surface.bounds); surface.draw(surface.bounds)
+        }
+        let cg = try XCTUnwrap(image.cgImage)
+        var bytes = [UInt8](repeating: 0, count: 200 * 200 * 4)
+        let context = try XCTUnwrap(CGContext(data: &bytes, width: 200, height: 200, bitsPerComponent: 8, bytesPerRow: 200 * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(cg, in: surface.bounds)
+        XCTAssertTrue(stride(from: 0, to: bytes.count, by: 4).contains { bytes[$0] > 240 && bytes[$0 + 1] < 20 && bytes[$0 + 2] < 20 })
+        XCTAssertEqual(surface.viewportQueryCount, 1)
+    }
+    func testSelectionBoundsAndDocumentIndexAreNotFrameWork() throws {
+        let elements = (0..<3000).map { index -> BoardElement in
+            var e = BoardElement(kind: .rectangle, id: "r-\(index)")
+            e.x = Double(index % 100) * 100; e.y = Double(index / 100) * 100; e.width = 40; e.height = 40
+            return e
+        }
+        let surface = BoardSurface(engine: try engine(elements))
+        surface.frame = CGRect(x: 0, y: 0, width: 800, height: 600); surface.layoutIfNeeded(); surface.select([elements[0].id])
+        let queries = surface.selectionBoundsCount
+        for x in 1...120 { surface.setViewport(BoardViewport(x: Double(x), y: 0, zoom: 1)); surface.reload(); surface.prepareFrame() }
+        XCTAssertEqual(surface.documentIndexCount, 1); XCTAssertEqual(surface.selectionBoundsCount, queries)
+        XCTAssertLessThanOrEqual(surface.viewportQueryCount, 2)
+    }
+
+    func testPenModeFingerNavigationAndOpeningPoliciesExcludePencil() throws {
+        let surface = BoardSurface(engine: try engine()); surface.tool = .pen
+        let finger = try XCTUnwrap((surface.gestureRecognizers ?? []).compactMap { $0 as? UIPanGestureRecognizer }
+            .first { $0.allowedTouchTypes == [NSNumber(value: UITouch.TouchType.direct.rawValue)] })
+        XCTAssertEqual(finger.minimumNumberOfTouches, 1)
+        let opening = try XCTUnwrap((surface.gestureRecognizers ?? []).compactMap { $0 as? UITapGestureRecognizer }.first)
+        XCTAssertEqual(Set(opening.allowedTouchTypes), Set([UITouch.TouchType.direct, .indirectPointer].map { NSNumber(value: $0.rawValue) }))
+        XCTAssertTrue(surface.gestureRecognizerShouldBegin(finger)); XCTAssertTrue(surface.gestureRecognizerShouldBegin(opening))
+        surface.tool = .rectangle
+        XCTAssertEqual(finger.minimumNumberOfTouches, 2)
+        XCTAssertFalse(surface.gestureRecognizerShouldBegin(opening))
+        surface.tool = .pen
+        let canvas = try XCTUnwrap(surface.subviews.compactMap { $0 as? PKCanvasView }.first)
+        surface.canvasViewDidBeginUsingTool(canvas)
+        XCTAssertFalse(surface.gestureRecognizerShouldBegin(finger))
+        XCTAssertFalse(surface.gestureRecognizerShouldBegin(opening))
+        surface.canvasViewDidEndUsingTool(canvas)
+    }
+
+    func testSystemContextRecognizerIsNotBlockedByRawSelectionContact() throws {
+        let surface = BoardSurface(engine: try engine())
+        surface.begin(at: CGPoint(x: 20, y: 20))
+        XCTAssertTrue(surface.isUsingTool)
+        XCTAssertTrue(surface.gestureRecognizerShouldBegin(UILongPressGestureRecognizer()))
+        XCTAssertTrue(surface.isUsingTool, "Configuration must not cancel an ordinary drag")
+        surface.cancelGesture(); surface.tool = .rectangle
+        XCTAssertFalse(surface.prepareContextMenu(), "Shape tools reserve their contacts for drawing")
+    }
+    private final class NavigationPan: UIPanGestureRecognizer {
+        override func translation(in view: UIView?) -> CGPoint { CGPoint(x: 75, y: -30) }
+        override func setTranslation(_ translation: CGPoint, in view: UIView?) {}
+    }
+    func testReadOnlySelectionAndPanRemainUsableWithoutMutations() throws {
+        var e = BoardElement(kind: .rectangle); e.width = 100; e.height = 100; e.fill = "#ffffff"
+        let surface = BoardSurface(engine: try engine([e])); surface.editable = false
+        var commands = 0; surface.onCommand = { _, _ in commands += 1; return true }
+        surface.begin(at: CGPoint(x: 30, y: 30)); surface.finish(at: CGPoint(x: 60, y: 60))
+        XCTAssertEqual(surface.selection, [e.id]); XCTAssertEqual(commands, 0)
+        let before = surface.viewport
+        _ = surface.perform(NSSelectorFromString("panned:"), with: NavigationPan())
+        XCTAssertEqual(surface.viewport.x, before.x + 75); XCTAssertEqual(surface.viewport.y, before.y - 30)
+        XCTAssertNotNil(surface.accessibilityValue)
+    }
+
+    func testFinishEditingTextDoesNotDiscardRejectedEditAndUsesKeyboardGuide() throws {
+        var e = BoardElement(kind: .rectangle); e.width = 100; e.height = 100; e.text = "source"
+        let surface = BoardSurface(engine: try engine([e]))
+        surface.frame = CGRect(x: 0, y: 0, width: 800, height: 600); surface.layoutIfNeeded()
+        _ = surface.perform(NSSelectorFromString("opened:"), with: EditorTap())
+        let editor = try XCTUnwrap(surface.subviews.compactMap { $0 as? UITextView }.first)
+        editor.text = "kept edit"
+        var accepted = false; surface.onCommand = { _, _ in accepted }
+        XCTAssertTrue(surface.constraints.contains { $0.secondItem === surface.keyboardLayoutGuide && $0.firstItem === editor })
+        XCTAssertFalse(surface.finishEditingText()); XCTAssertEqual(editor.text, "kept edit")
+        accepted = true
+        XCTAssertTrue(surface.finishEditingText()); XCTAssertFalse(surface.isEditingText)
+    }
+
+    func testThousandPortablePathsDoNotRebuildDuringFramesOrTransientMoves() {
+        let items = (0..<1000).map { index -> BoardRenderItem in
+            var e = BoardElement(kind: .pen, id: "pen-\(index)")
+            e.x = Double(index % 40) * 20; e.y = Double(index / 40) * 20
+            let points = (0..<32).map { [e.x + Double($0) / 2, e.y + Double($0 % 3)] }
+            return BoardRenderItem(element: e, points: points)
+        }
+        let renderer = BoardRenderer(), format = UIGraphicsImageRendererFormat(); format.scale = 1
+        func frame(moving: Set<String> = []) {
+            _ = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 600), format: format).image { output in
+                renderer.draw(items, board: .empty, in: output.cgContext, zoom: 1, moving: moving, offset: CGPoint(x: 3, y: 5))
+            }
+        }
+        frame(); XCTAssertEqual(renderer.pathBuildCount, 1000)
+        for _ in 0..<10 { frame() }
+        frame(moving: Set(items.prefix(500).map { $0.element.id }))
+        XCTAssertEqual(renderer.pathBuildCount, 1000)
+    }
+
+    func testShapeLabelsAreCenteredLikeTheWebBoard() throws {
+        var element = BoardElement(kind: .rectangle, id: "label")
+        element.x = 20; element.y = 20; element.width = 160; element.height = 100
+        element.text = "Label"; element.fontSize = 20; element.stroke = "#000000"; element.fill = "#ffffff"
+        let renderer = BoardRenderer(), format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 140), format: format).image { output in
+            UIColor.white.setFill(); output.fill(CGRect(x: 0, y: 0, width: 200, height: 140))
+            renderer.draw([BoardRenderItem(element: element, points: nil)], board: .empty, in: output.cgContext, zoom: 1)
+        }
+        var bytes = [UInt8](repeating: 0, count: 200 * 140 * 4)
+        let context = try XCTUnwrap(CGContext(data: &bytes, width: 200, height: 140, bitsPerComponent: 8, bytesPerRow: 200 * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(try XCTUnwrap(image.cgImage), in: CGRect(x: 0, y: 0, width: 200, height: 140))
+        var xs: [Int] = [], ys: [Int] = []
+        for y in 24..<116 { for x in 24..<176 where bytes[(y * 200 + x) * 4] < 100 { xs.append(x); ys.append(y) } }
+        let minX = try XCTUnwrap(xs.min()), maxX = try XCTUnwrap(xs.max())
+        let minY = try XCTUnwrap(ys.min()), maxY = try XCTUnwrap(ys.max())
+        XCTAssertEqual(Double(minX + maxX) / 2, 100, accuracy: 4)
+        XCTAssertEqual(Double(minY + maxY) / 2, 70, accuracy: 6)
+    }
+    private final class CardProvider: BoardVisualProvider {
+        var paper = PaperInfo(id: "paper", title: "Synthetic paper title", spaceID: "s", abstract: "An actual synthetic abstract for layout regression.")
+        func paperInfo(for element: BoardElement) -> PaperInfo? { paper }
+        func preview(for element: BoardElement, asset: BoardAsset?, targetSize: CGSize) -> UIImage? { nil }
+    }
+    func testPaperCardTextLayoutIsReusedUntilItsProjectionChanges() {
+        let provider = CardProvider(), renderer = BoardRenderer(); renderer.visuals = provider
+        var e = BoardElement(kind: .paper); e.width = 360; e.height = 280; e.paperId = "paper"
+        func frame() {
+            _ = UIGraphicsImageRenderer(size: CGSize(width: 360, height: 280)).image { output in
+                renderer.draw([BoardRenderItem(element: e, points: nil)], board: .empty, in: output.cgContext, zoom: 1)
+            }
+        }
+        for _ in 0..<30 { frame() }
+        XCTAssertEqual(renderer.paperCardLayoutCount, 1)
+        provider.paper.isRead = true; frame()
+        XCTAssertEqual(renderer.paperCardLayoutCount, 2)
+        e.paperTitle = "User title override"; frame()
+        XCTAssertEqual(renderer.paperCardLayoutCount, 3)
+    }
+
 }

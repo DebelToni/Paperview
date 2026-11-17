@@ -6,6 +6,20 @@ import SwiftMath
 @MainActor
 final class BoardTextLayout {
     struct Link { let url: URL; let rect: CGRect }
+    struct Signature: Equatable {
+        let source: String, color: String
+        let fontSize: Double
+        let fontFamily: String
+        let bold: Bool, italic: Bool
+        init(_ element: BoardElement) {
+            source = element.text ?? ""; color = element.stroke; fontSize = element.fontSize ?? 18
+            fontFamily = element.fontFamily ?? "sans-serif"; bold = element.bold ?? false; italic = element.italic ?? false
+        }
+    }
+    let estimatedCost: Int
+    static let attachmentByteLimit = 8_000_000
+    let attachmentBytes: Int
+    let sourceMathFallbackCount: Int
     enum Failure: Error { case invalidInput, missingParser, parser(String) }
     let source: String
     let size: CGSize
@@ -15,6 +29,8 @@ final class BoardTextLayout {
         let manager: NSLayoutManager
         let container: NSTextContainer
         let origin: CGPoint
+        let bounds: CGRect
+        let glyphs: NSRange
     }
     private let chunks: [Chunk]
     private let rules: [CGRect]
@@ -79,6 +95,10 @@ final class BoardTextLayout {
         var found: [Link] = []
         var y: CGFloat = 0
         var extent: CGFloat = 0
+        // Also covers table measurement passes. Reuse locally even if NSCache evicts.
+        var images: [NSString: UIImage] = [:]
+        var bitmapBytes = 0
+        var fallbackCount = 0
         let ink = BoardRenderer.color(element.stroke)
         func measure(_ text: NSAttributedString, width: CGFloat, at origin: CGPoint? = nil) -> CGSize {
             let storage = NSTextStorage(attributedString: text)
@@ -88,7 +108,8 @@ final class BoardTextLayout {
             storage.addLayoutManager(manager); manager.addTextContainer(container); manager.ensureLayout(for: container)
             let used = manager.usedRect(for: container)
             if let origin {
-                built.append(Chunk(storage: storage, manager: manager, container: container, origin: origin))
+                built.append(Chunk(storage: storage, manager: manager, container: container, origin: origin,
+                                   bounds: used, glyphs: manager.glyphRange(for: container)))
                 storage.enumerateAttribute(.link, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
                     guard let url = value as? URL else { return }
                     let glyphs = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
@@ -114,7 +135,16 @@ final class BoardTextLayout {
             let font = attrs[.font] as? UIFont ?? initial
             guard Self.mathFitsBudget(tex) else { append("⟦TeX exceeds native rendering limits⟧", attrs.merging([.foregroundColor: UIColor.systemRed]) { _, new in new }); return }
             let key = "\(font.fontName):\(font.pointSize):\(display):\(available):\(element.stroke):4:\(tex)" as NSString
-            var image = Self.mathCache.object(forKey: key)
+            func sourceFallback() {
+                fallbackCount += 1
+                append(display ? "$$\n\(tex)\n$$" : "$\(tex)$", attrs)
+            }
+            var image = images[key] ?? Self.mathCache.object(forKey: key)
+            if images[key] == nil, let cached = image, let cg = cached.cgImage {
+                let cost = cg.bytesPerRow * cg.height
+                guard cost <= Self.attachmentByteLimit - bitmapBytes else { sourceFallback(); return }
+                images[key] = cached; bitmapBytes += cost
+            }
             if image == nil {
                 let label = MTMathUILabel()
                 label.fontSize = font.pointSize
@@ -127,15 +157,30 @@ final class BoardTextLayout {
                       natural.width <= 8192, natural.height <= 8192 else { append("⟦TeX: \(tex)⟧", attrs); return }
                 let scale = min(1, available / natural.width, 1024 / max(natural.width, natural.height))
                 let bounds = CGSize(width: natural.width * scale, height: natural.height * scale)
+                // Fixed RGBA8 backing makes the pre-allocation check exact, including
+                // row padding. No uncharged 4x attachment survives cache eviction.
+                let pixelsWide = max(1, Int(ceil(bounds.width * 4)))
+                let pixelsHigh = max(1, Int(ceil(bounds.height * 4)))
+                let rowBytes = (pixelsWide * 4 + 63) / 64 * 64
+                let cost = rowBytes * pixelsHigh
+                guard cost <= Self.attachmentByteLimit - bitmapBytes else { sourceFallback(); return }
+                guard let context = CGContext(data: nil, width: pixelsWide, height: pixelsHigh,
+                                              bitsPerComponent: 8, bytesPerRow: rowBytes,
+                                              space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                    sourceFallback(); return
+                }
                 label.frame = CGRect(origin: .zero, size: natural)
                 label.layoutIfNeeded()
-                let format = UIGraphicsImageRendererFormat(); format.scale = 4
-                image = UIGraphicsImageRenderer(size: bounds, format: format).image { renderer in
-                    renderer.cgContext.translateBy(x:0,y:bounds.height)
-                    renderer.cgContext.scaleBy(x:scale,y:-scale)
-                    label.layer.render(in: renderer.cgContext)
-                }
-                if let image { Self.mathCache.totalCostLimit = 8_000_000; Self.mathCache.countLimit = 64; Self.mathCache.setObject(image, forKey: key, cost: Int(bounds.width * bounds.height * 64)) }
+                context.scaleBy(x: 4 * scale, y: 4 * scale)
+                label.layer.render(in: context)
+                guard let cg = context.makeImage() else { sourceFallback(); return }
+                let rendered = UIImage(cgImage: cg, scale: 4, orientation: .up)
+                image = rendered
+                images[key] = rendered; bitmapBytes += cost
+                Self.mathCache.totalCostLimit = Self.attachmentByteLimit
+                Self.mathCache.countLimit = 64
+                Self.mathCache.setObject(rendered, forKey: key, cost: cost)
             }
             if let image {
                 let attachment = NSTextAttachment(); attachment.image = image
@@ -269,16 +314,37 @@ final class BoardTextLayout {
         flush()
         chunks = built; rules = decorations; color = ink; links = found
         size = CGSize(width: min(width, extent), height: max(base * 1.3, y))
+        var retainedImages = Set<ObjectIdentifier>()
+        var retainedBytes = 0
+        for chunk in built {
+            chunk.storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: chunk.storage.length)) { value, _, _ in
+                guard let image = (value as? NSTextAttachment)?.image, let cg = image.cgImage,
+                      retainedImages.insert(ObjectIdentifier(image)).inserted else { return }
+                retainedBytes += cg.bytesPerRow * cg.height
+            }
+        }
+        attachmentBytes = retainedBytes
+        sourceMathFallbackCount = fallbackCount
+        estimatedCost = retainedBytes + max(1024, source.utf16.count * 48 + built.count * 1024 + decorations.count * 64 + found.count * 256)
     }
 
     func draw(in context: CGContext, at point: CGPoint = .zero) {
         context.saveGState(); defer { context.restoreGState() }
         UIGraphicsPushContext(context); defer { UIGraphicsPopContext() }
         context.setFillColor(color.cgColor)
-        for rect in rules { context.fill(rect.offsetBy(dx: point.x, dy: point.y)) }
+        let clip = context.boundingBoxOfClipPath
+        for rect in rules {
+            let placed = rect.offsetBy(dx: point.x, dy: point.y)
+            if placed.intersects(clip) { context.fill(placed) }
+        }
         for chunk in chunks {
-            let range = chunk.manager.glyphRange(for: chunk.container)
             let origin = CGPoint(x: point.x + chunk.origin.x, y: point.y + chunk.origin.y)
+            let localClip = clip.offsetBy(dx: -origin.x, dy: -origin.y)
+            guard chunk.bounds.intersects(localClip) else { continue }
+            // TextKit's immutable layout is reused; glyph work follows the visible
+            // region of long text, rather than drawing its entire stored source.
+            let range = NSIntersectionRange(chunk.glyphs, chunk.manager.glyphRange(forBoundingRect: localClip, in: chunk.container))
+            guard range.length > 0 else { continue }
             chunk.manager.drawBackground(forGlyphRange: range, at: origin)
             chunk.manager.drawGlyphs(forGlyphRange: range, at: origin)
         }

@@ -1,16 +1,34 @@
 import XCTest
 @testable import Paperview
 
+private func boardRequestBody(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody { return body }
+    let stream = try XCTUnwrap(request.httpBodyStream)
+    stream.open(); defer { stream.close() }
+    var data = Data(), buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count < 0 { throw stream.streamError ?? PaperError.invalidResponse }
+        if count == 0 { return data }
+        guard data.count + count <= 25 * 1024 * 1024 else { throw PaperError.oversized }
+        data.append(contentsOf: buffer.prefix(count))
+    }
+}
 private final class BoardMockProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (Int, Data))?
+    static var intercept: ((BoardMockProtocol) -> Bool)?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        if Self.intercept?(self) == true { return }
         do {
             let (status, data) = try Self.handler!(request)
-            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data); client?.urlProtocolDidFinishLoading(self)
+            complete(status: status, data: data)
         } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    func complete(status: Int, data: Data) {
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data); client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
 }
@@ -18,7 +36,7 @@ private final class BoardMockProtocol: URLProtocol {
     private func api(cookies: [HTTPCookie] = []) -> SpaceAPI { SpaceAPI(origin: URL(string: "https://fixture.invalid")!, cookies: cookies, protocolClasses: [BoardMockProtocol.self]) }
     private let me = Data(#"{"user":{"id":"canonical","email":"test@example.invalid","nickname":"Test","is_admin":false,"approved":true}}"#.utf8)
     private let snapshot = Data(#"{"space":{"id":"s","title":"Fixture","visibility":"private","creator_id":"canonical","revision":1,"member":true,"shared":false,"created_at":0},"board":{"version":1,"elements":[],"assets":{}},"creators":{},"papers":[]}"#.utf8)
-    override func tearDown() { BoardMockProtocol.handler = nil; super.tearDown() }
+    override func tearDown() { BoardMockProtocol.handler = nil; BoardMockProtocol.intercept = nil; super.tearDown() }
     func testInvalidIdentifiersNeverReachNetwork() async throws {
         BoardMockProtocol.handler = { _ in XCTFail("Unexpected network"); throw PaperError.invalidResponse }
         let service = api()
@@ -119,4 +137,164 @@ private final class BoardMockProtocol: URLProtocol {
         BoardMockProtocol.handler = { _ in (200,anonymous) }
         do { _ = try await member.space(id:"s"); XCTFail("Account cache switched to anonymous") } catch PaperError.unauthorized {}
     }
+    func testTextDefaultsAreCanonicalizedOnReadAndBeforePUT() async throws {
+        let me = me
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot) as? [String: Any])
+        var text = BoardElement(kind: .text, id: "text"); text.text = "Synthetic"
+        let original = BoardDocument(elements: [text])
+        payload["board"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(original))
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            if request.httpMethod == "PUT" {
+                let body = try boardRequestBody(request)
+                let value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                let board = try XCTUnwrap(value["board"] as? [String: Any])
+                let element = try XCTUnwrap((board["elements"] as? [[String: Any]])?.first)
+                XCTAssertEqual(element["fontSize"] as? Double, 18)
+                XCTAssertEqual(element["fontFamily"] as? String, "sans-serif")
+                XCTAssertNil(element["bold"]); XCTAssertNil(element["autoFontSize"])
+                return (200, Data(#"{"revision":2}"#.utf8))
+            }
+            return (200, data)
+        }
+        let service = api(), loaded = try await service.space(id: "s")
+        XCTAssertEqual(loaded.board.element("text")?.fontSize, 18)
+        XCTAssertEqual(loaded.board.element("text")?.fontFamily, "sans-serif")
+        _ = try await service.saveBoard(id: "s", revision: 1, board: original)
+        XCTAssertNil(service.nativeSpaceCache)
+    }
+    func testLostOrSuccessfulPUTInvalidatesOnlyAuthoritativeBoardCache() async throws {
+        let me = me, snapshot = snapshot
+        let service = api()
+        BoardMockProtocol.handler = { request in (200, request.url!.path == "/api/me" ? me : snapshot) }
+        _ = try await service.space(id: "s")
+        let generation = service.nativeSpaceGeneration
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            XCTAssertEqual(request.httpMethod, "PUT")
+            return (500, Data(#"{"detail":"Lost acknowledgement"}"#.utf8))
+        }
+        do { _ = try await service.saveBoard(id: "s", revision: 1, board: .empty); XCTFail("Failure accepted") } catch PaperError.http(500, _) {}
+        XCTAssertNil(service.nativeSpaceCache); XCTAssertGreaterThan(service.nativeSpaceGeneration, generation)
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            XCTAssertNil(request.url!.query)
+            return (200, snapshot)
+        }
+        _ = try await service.space(id: "s")
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            return (200, Data(#"{"revision":2}"#.utf8))
+        }
+        _ = try await service.saveBoard(id: "s", revision: 1, board: .empty)
+        XCTAssertNil(service.nativeSpaceCache)
+    }
+    func testPUTReceiptCannotStandInForAnAuthoritativeNullBoardCache() async throws {
+        let me = me, snapshot = snapshot
+        let service = api()
+        BoardMockProtocol.handler = { request in (200, request.url!.path == "/api/me" ? me : snapshot) }
+        _ = try await service.space(id: "s")
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot) as? [String: Any])
+        payload["board"] = NSNull()
+        var summary = try XCTUnwrap(payload["space"] as? [String: Any]); summary["revision"] = 2; payload["space"] = summary
+        let omitted = try JSONSerialization.data(withJSONObject: payload)
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            if request.httpMethod == "PUT" { return (200, Data(#"{"revision":2}"#.utf8)) }
+            XCTAssertNil(request.url!.query)
+            return (200, omitted)
+        }
+        _ = try await service.saveBoard(id: "s", revision: 1, board: .empty)
+        do { _ = try await service.space(id: "s"); XCTFail("PUT-only cache accepted") } catch PaperError.invalidResponse {}
+        XCTAssertNil(service.nativeSpaceCache)
+    }
+    func testGETThatStartedBeforePUTCannotRefillInvalidatedCache() async throws {
+        let me = me, snapshot = snapshot
+        let service = api()
+        BoardMockProtocol.handler = { request in (200, request.url!.path == "/api/me" ? me : snapshot) }
+        _ = try await service.space(id: "s")
+        let held = expectation(description: "Older GET is in flight")
+        var delayed: BoardMockProtocol?
+        BoardMockProtocol.intercept = { operation in
+            guard operation.request.url!.path == "/api/spaces/s", delayed == nil else { return false }
+            delayed = operation; held.fulfill(); return true
+        }
+        let older = Task { try await service.space(id: "s") }
+        await fulfillment(of: [held], timeout: 3)
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            XCTAssertEqual(request.httpMethod, "PUT")
+            return (200, Data(#"{"revision":2}"#.utf8))
+        }
+        _ = try await service.saveBoard(id: "s", revision: 1, board: .empty)
+        try XCTUnwrap(delayed).complete(status: 200, data: snapshot)
+        do { _ = try await older.value; XCTFail("Pre-PUT GET accepted after invalidation") } catch PaperError.invalidResponse {}
+        XCTAssertNil(service.nativeSpaceCache)
+    }
+    func testOutOfOrderReadsCannotRegressRevisionCache() async throws {
+        let me = me, snapshot = snapshot
+        let service = api()
+        BoardMockProtocol.handler = { request in (200, request.url!.path == "/api/me" ? me : snapshot) }
+        _ = try await service.space(id: "s")
+        let held = expectation(description: "Older poll is in flight")
+        var delayed: BoardMockProtocol?
+        BoardMockProtocol.intercept = { operation in
+            guard operation.request.url!.path == "/api/spaces/s", delayed == nil else { return false }
+            delayed = operation; held.fulfill(); return true
+        }
+        let older = Task { try await service.space(id: "s") }
+        await fulfillment(of: [held], timeout: 3)
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot) as? [String: Any])
+        var summary = try XCTUnwrap(payload["space"] as? [String: Any]); summary["revision"] = 3; payload["space"] = summary
+        let newest = try JSONSerialization.data(withJSONObject: payload)
+        BoardMockProtocol.handler = { request in (200, request.url!.path == "/api/me" ? me : newest) }
+        _ = try await service.space(id: "s")
+        summary["revision"] = 2; payload["space"] = summary
+        try XCTUnwrap(delayed).complete(status: 200, data: JSONSerialization.data(withJSONObject: payload))
+        let received = try await older.value
+        XCTAssertEqual(received.space.revision, 2)
+        XCTAssertEqual(service.nativeSpaceCache?.space.revision, 3)
+    }
+    func testFullBoardsRemainCompatibleWhenServerIgnoresKnownRevision() async throws {
+        let me = me, snapshot = snapshot
+        var reads = 0
+        BoardMockProtocol.handler = { request in
+            if request.url!.path == "/api/me" { return (200, me) }
+            reads += 1
+            if reads > 1 { XCTAssertEqual(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, "1") }
+            return (200, snapshot)
+        }
+        let service = api()
+        let first = try await service.space(id: "s"), second = try await service.space(id: "s")
+        XCTAssertEqual(first.board, second.board); XCTAssertEqual(reads, 2)
+    }
+
+    func testGETStartedDuringPUTCannotInstallItsOldBoardAfterAcknowledgement() async throws {
+        let me = me, snapshot = snapshot
+        let service = api()
+        BoardMockProtocol.handler = { request in (200, request.url!.path == "/api/me" ? me : snapshot) }
+        _ = try await service.space(id: "s")
+        let putHeld = expectation(description: "PUT is in flight"), getHeld = expectation(description: "GET started during PUT")
+        var delayedPUT: BoardMockProtocol?, delayedGET: BoardMockProtocol?
+        BoardMockProtocol.intercept = { operation in
+            if operation.request.httpMethod == "PUT" {
+                delayedPUT = operation; putHeld.fulfill(); return true
+            }
+            if operation.request.url!.path == "/api/spaces/s" {
+                delayedGET = operation; getHeld.fulfill(); return true
+            }
+            return false
+        }
+        let saving = Task { try await service.saveBoard(id: "s", revision: 1, board: .empty) }
+        await fulfillment(of: [putHeld], timeout: 3)
+        let reading = Task { try await service.space(id: "s") }
+        await fulfillment(of: [getHeld], timeout: 3)
+        try XCTUnwrap(delayedPUT).complete(status: 200, data: Data(#"{"revision":2}"#.utf8))
+        _ = try await saving.value
+        try XCTUnwrap(delayedGET).complete(status: 200, data: snapshot)
+        do { _ = try await reading.value; XCTFail("Pre-commit board installed after PUT completed") } catch PaperError.invalidResponse {}
+        XCTAssertNil(service.nativeSpaceCache)
+    }
+
 }

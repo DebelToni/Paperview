@@ -69,4 +69,44 @@ final class BoardMergeTests: XCTestCase {
         arrow.startAnchor = .init(elementId: "a", x: 0, y: 0)
         XCTAssertFalse(boardIssues(doc([arrow])).isEmpty)
     }
+    func testOnlyContractTextDefaultsAreCanonicalAliases() {
+        var text = BoardElement(kind: .text, id: "text"); text.text = "Synthetic"
+        let legacy = doc([text]); var canonical = text; canonical.fontSize = 18; canonical.fontFamily = "sans-serif"
+        XCTAssertTrue(sameBoard(legacy, doc([canonical])))
+        var edited = text; edited.x = 8
+        let merged = mergeBoards(legacy, doc([edited]), doc([canonical]))
+        XCTAssertEqual(merged?.element("text")?.x, 8)
+        XCTAssertEqual(merged?.element("text")?.fontSize, 18)
+        XCTAssertEqual(merged?.element("text")?.fontFamily, "sans-serif")
+        canonical.bold = false
+        XCTAssertFalse(sameBoard(legacy, doc([canonical])))
+        canonical = text; canonical.fontSize = 19
+        XCTAssertFalse(sameBoard(legacy, doc([canonical])))
+        var shape = item("shape"), explicit = shape; explicit.fontFamily = "sans-serif"
+        XCTAssertFalse(sameBoard(doc([shape]), doc([explicit])))
+        shape.version += 1
+        XCTAssertFalse(sameBoard(doc([shape]), doc([item("shape")])))
+    }
+    func testOneULPGeometryDifferenceRemainsARealConflict() {
+        let original = item("a", 435.21739130434787)
+        var local = original; local.fill = "#ff0000"
+        var remote = original; remote.x = original.x.nextDown
+        XCTAssertFalse(sameBoard(doc([original]), doc([remote])))
+        let conflicts = boardConflicts(doc([original]), doc([local]), doc([remote]))
+        XCTAssertEqual(conflicts.map(\.id), ["a"])
+        let choice = BoardResolution(conflict: conflicts[0], choice: .local)
+        remote.x = remote.x.nextDown
+        XCTAssertNil(mergeBoards(doc([original]), doc([local]), doc([remote]), resolutions: [choice]))
+    }
+    func testDefaultCanonicalizationDoesNotUnbindVersionReviewedChoices() {
+        var base = BoardElement(kind: .text, id: "a"); base.text = "Base"
+        var local = base; local.text = "Local"
+        var remote = canonicalBoardElement(base); remote.text = "Remote"
+        let conflict = boardConflicts(doc([base]), doc([local]), doc([remote]))[0]
+        let choice = BoardResolution(conflict: conflict, choice: .local)
+        XCTAssertEqual(mergeBoards(doc([base]), doc([local]), doc([remote]), resolutions: [choice])?.element("a")?.text, "Local")
+        remote.version += 1
+        XCTAssertNil(mergeBoards(doc([base]), doc([local]), doc([remote]), resolutions: [choice]))
+    }
+
 }

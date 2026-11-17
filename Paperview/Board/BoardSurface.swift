@@ -14,27 +14,37 @@ struct BoardViewport: Codable, Equatable {
 @MainActor final class BoardSurface: UIView, PKCanvasViewDelegate, UIGestureRecognizerDelegate, UITextViewDelegate {
     let engine: BoardEngine
     let renderer = BoardRenderer()
-    var tool: BoardTool = .select { didSet { cancelGesture(); updateInput() } }
+    var tool: BoardTool = .select { didSet { if tool != oldValue { cancelGesture(); updateInput() } } }
     var strokeColor = "#202124" { didSet { updateInput() } }
     var fillColor = "transparent"
     var strokeWidth: Double = 2 { didSet { updateInput() } }
     private(set) var selection: [String] = []
     private(set) var viewport = BoardViewport()
     private(set) var isUsingTool = false
-    var editable = true { didSet { if !editable { cancelGesture() }; updateInput() } }
+    var editable = true { didSet { if editable != oldValue { renderer.invalidateNativeInk(); if !editable { cancelGesture() }; updateInput() } } }
     var papers: [PaperInfo] = []
     var nativeStroke: ((BoardElement) -> Data?)? { didSet { renderer.nativeStroke = nativeStroke } }
     var onCommand: ((BoardCommand, [String: Data]) -> Bool)?
-    private var retainedInk: (BoardCommand, [String: Data], Data)?
+    private struct RetainedInk {
+        var command: BoardCommand?
+        var archives: [String: Data]
+        var drawing: PKDrawing
+        var data: Data
+        var recoveryID: String
+    }
+    private var retainedInk: RetainedInk?
+    var onUnconvertedInk: ((Data, String) -> Bool)?
     var hasRetainedInk: Bool { retainedInk != nil }
-    func retainedInkData() -> Data? { retainedInk?.2 }
+    func retainedInkData() -> Data? { retainedInk?.data }
     func acknowledgeRetainedInk() {
-        retainedInk = nil; ignoringInk = true; ink.drawing = PKDrawing(); ignoringInk = false
+        retainedInk = nil; retainedViewport = nil; ignoringInk = true; ink.drawing = PKDrawing(); ignoringInk = false
         updateInput(); reload()
     }
     func retryRetainedInk() {
         guard let retainedInk else { return }
-        if onCommand?(retainedInk.0, retainedInk.1) == true { acknowledgeRetainedInk() }
+        if let command = retainedInk.command {
+            if onCommand?(command, retainedInk.archives) == true { acknowledgeRetainedInk() }
+        } else { _ = onUnconvertedInk?(retainedInk.data, retainedInk.recoveryID) }
     }
     var onSelection: (([String]) -> Void)?
     var onOpen: ((BoardElement?) -> Void)?
@@ -45,6 +55,21 @@ struct BoardViewport: Codable, Equatable {
 
     private let ink = BoardContactCanvas()
     private var items: [BoardRenderItem] = []
+    private var contentGeneration: UInt64?
+    private var itemGeneration: UInt64?
+    private var queryRect: CGRect?
+    private var queryZoom: Double = 1
+    private var elements: [String: BoardElement] = [:]
+    private var elementOrder: [String: Int] = [:]
+    private var groups: [String: [String]] = [:]
+    private var nextZ: Double = 1
+    private var selectedIDs = Set<String>()
+    private var selectionBounds: BoardRect?
+    private var retainedViewport: BoardViewport?
+    // Deterministic work counters for large synthetic-board regressions.
+    private(set) var documentIndexCount = 0
+    private(set) var viewportQueryCount = 0
+    private(set) var selectionBoundsCount = 0
     private var start: BoardPoint?
     private var current: BoardPoint?
     private var originalBounds: BoardRect?
@@ -76,9 +101,9 @@ struct BoardViewport: Codable, Equatable {
     private var pan: UIPanGestureRecognizer!
     private var pinch: UIPinchGestureRecognizer!
     private var pointerPan: UIPanGestureRecognizer!
+    private var openGesture: UITapGestureRecognizer!
     private var selectionRect: CGRect?
     private var erasedIDs = Set<String>()
-    private var assetPayloads: [String: BoardAsset] = [:]
     private var activeTouch: UITouch?
     private var navigating = false
 
@@ -89,6 +114,7 @@ struct BoardViewport: Codable, Equatable {
         isAccessibilityElement = true; accessibilityLabel = "Drawing canvas"; accessibilityTraits.insert(.allowsDirectInteraction)
         ink.backgroundColor = .clear; ink.isOpaque = false; ink.drawingPolicy = .pencilOnly
         ink.isScrollEnabled = false; ink.delegate = self
+        ink.panGestureRecognizer.isEnabled = false; ink.pinchGestureRecognizer?.isEnabled = false
         ink.contactBegan = { [weak self] in self?.beginInkContact() }
         ink.contactCancelled = { [weak self] in self?.cancelGesture() }
         addSubview(ink)
@@ -101,13 +127,16 @@ struct BoardViewport: Codable, Equatable {
         pointerPan.delegate = self; addGestureRecognizer(pointerPan)
         pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
         pinch.delegate = self; addGestureRecognizer(pinch)
-        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(opened(_:)))
-        doubleTap.numberOfTapsRequired = 2; doubleTap.allowedTouchTypes = [0, 2]
-        addGestureRecognizer(doubleTap)
+        openGesture = UITapGestureRecognizer(target: self, action: #selector(opened(_:)))
+        openGesture.numberOfTapsRequired = 2
+        openGesture.allowedTouchTypes = [UITouch.TouchType.direct, .indirectPointer].map { NSNumber(value: $0.rawValue) }
+        openGesture.delegate = self; addGestureRecognizer(openGesture)
+        renderer.onChange = { [weak self] in self?.invalidateVisuals() }
+        renderer.onError = { [weak self] in self?.onError?($0) }
         updateInput(); reload()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func layoutSubviews() { super.layoutSubviews(); reload() }
+    override func layoutSubviews() { super.layoutSubviews(); if bounds.size != layoutSize { reload() } }
 
     private func beginInkContact() {
         guard editable, tool == .pen, !hasRetainedInk, !isUsingTool else { return }
@@ -116,7 +145,56 @@ struct BoardViewport: Codable, Equatable {
     private func updateInput() {
         guard !isUsingTool else { return }
         ink.isUserInteractionEnabled = editable && !hasRetainedInk && tool == .pen
+        // Pencil-only children still receive finger hit tests. Their ancestor owns navigation.
+        pan.minimumNumberOfTouches = tool == .pen || tool == .hand || !editable || hasRetainedInk ? 1 : 2
         ink.tool = PKInkingTool(.monoline, color: BoardRenderer.color(strokeColor), width: strokeWidth * viewport.zoom)
+    }
+    func invalidateVisuals() { setNeedsDisplay() }
+
+    private func indexDocument() throws {
+        guard contentGeneration != engine.contentGeneration else { return }
+        elements.removeAll(keepingCapacity: true); elementOrder.removeAll(keepingCapacity: true); groups.removeAll(keepingCapacity: true)
+        nextZ = 1
+        for (index, e) in engine.board.elements.enumerated() {
+            elements[e.id] = e; elementOrder[e.id] = index; nextZ = max(nextZ, e.z + 1)
+            if !e.deleted, let group = e.groupId { groups[group, default: []].append(e.id) }
+        }
+        contentGeneration = engine.contentGeneration; documentIndexCount += 1
+        renderer.updateAssets(engine.board.assets); renderer.invalidateNativeInk()
+        let live = selection.filter { elements[$0]?.deleted == false }
+        if live != selection { selection = live; selectedIDs = Set(live); onSelection?(selection) }
+        try updateSelectionBounds()
+    }
+    private func updateSelectionBounds() throws {
+        guard !selection.isEmpty else { selectionBounds = nil; return }
+        selectionBoundsCount += 1; selectionBounds = try engine.bounds(selection)
+    }
+
+    /// UIKit coalesces invalidations. Only a painted frame crosses the Rust query/JSON boundary.
+    func prepareFrame() {
+        guard !isUsingTool || navigating else { return }
+        do {
+            try indexDocument()
+            let a = viewport.world(.zero)
+            let visible = CGRect(x: a.x, y: a.y, width: bounds.width / viewport.zoom, height: bounds.height / viewport.zoom)
+            if itemGeneration != contentGeneration || queryRect?.contains(visible) != true ||
+                viewport.zoom / queryZoom < 0.8 || viewport.zoom / queryZoom > 1.25 {
+                // Retain a bounded near-viewport query while panning. Resource
+                // providers still see only items intersecting the actual clip.
+                let padded = visible.insetBy(dx: -128 / viewport.zoom, dy: -128 / viewport.zoom)
+                // Prefetch must obey the same scalar limits as a visible-only query.
+                // Clipping its padding never changes document coordinates.
+                let limit: CGFloat = 10_000_000
+                let x = max(-limit, min(limit, padded.minX)), y = max(-limit, min(limit, padded.minY))
+                let region = CGRect(x: x, y: y, width: max(0, min(limit, padded.maxX - x)), height: max(0, min(limit, padded.maxY - y)))
+                items = try engine.query(BoardRect(x: region.minX, y: region.minY, width: region.width, height: region.height))
+                itemGeneration = contentGeneration; queryRect = region; queryZoom = viewport.zoom; viewportQueryCount += 1
+            }
+            if let retainedInk, retainedViewport != viewport {
+                ignoringInk = true; ink.drawing = BoardInk.screenDrawing(retainedInk.drawing, viewport: viewport); ignoringInk = false
+                retainedViewport = viewport
+            }
+        } catch { onError?(error) }
     }
     func reload() {
         // The controller defers replacement during contact; also keep our transient view intact.
@@ -126,20 +204,17 @@ struct BoardViewport: Codable, Equatable {
             onViewport?(viewport)
         }
         layoutSize = bounds.size; ink.frame = bounds
-        do {
-            let payloads = engine.board.assets
-            if payloads != assetPayloads { renderer.invalidateAssets(); assetPayloads = payloads }
-            let a = viewport.world(.zero), b = viewport.world(CGPoint(x: bounds.maxX, y: bounds.maxY))
-            items = try engine.query(BoardRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y))
-            selection = selection.filter { engine.board.element($0)?.deleted == false }
-            setNeedsDisplay()
-        } catch { onError?(error) }
+        do { try indexDocument(); setNeedsDisplay(); updateAccessibilityViewport() } catch { onError?(error) }
     }
     func select(_ ids: [String]) {
-        let selected = Set(ids)
-        let groups = Set(engine.board.elements.filter { selected.contains($0.id) }.compactMap { $0.groupId })
-        selection = engine.board.elements.filter { !$0.deleted && (selected.contains($0.id) || $0.groupId.map { groups.contains($0) } == true) }.map { $0.id }
-        onSelection?(selection); setNeedsDisplay()
+        do {
+            try indexDocument()
+            var selected = Set(ids.filter { elements[$0]?.deleted == false })
+            for id in ids { if let group = elements[id]?.groupId { selected.formUnion(groups[group] ?? []) } }
+            let values = selected.sorted { elementOrder[$0, default: 0] < elementOrder[$1, default: 0] }
+            if values != selection { selection = values; selectedIDs = selected; try updateSelectionBounds(); onSelection?(selection) }
+            setNeedsDisplay()
+        } catch { onError?(error) }
     }
     func fit() {
         do {
@@ -158,30 +233,32 @@ struct BoardViewport: Codable, Equatable {
     }
     func setViewport(_ value: BoardViewport) {
         guard !isUsingTool, value.x.isFinite, value.y.isFinite, value.zoom.isFinite, value.zoom > 0 else { return }
-        viewport = BoardViewport(x: value.x, y: value.y, zoom: max(0.05, min(8, value.zoom)))
-        updateInput(); reload(); onViewport?(viewport)
+        let next = BoardViewport(x: value.x, y: value.y, zoom: max(0.05, min(8, value.zoom)))
+        guard next != viewport else { return }
+        let zoomChanged = next.zoom != viewport.zoom; viewport = next
+        if zoomChanged { updateInput() }
+        setNeedsDisplay(); updateAccessibilityViewport(); onViewport?(viewport)
+    }
+    private func updateAccessibilityViewport() {
+        let center = viewport.world(CGPoint(x: bounds.midX, y: bounds.midY))
+        accessibilityValue = String(format: "Zoom %.0f%%, center %.1f, %.1f", viewport.zoom * 100, center.x, center.y)
     }
     func cancelGesture() {
         activeTouch = nil; navigating = false
         erasedIDs.removeAll()
-        start = nil; current = nil; originalBounds = nil; endpoint = nil; endpointElement = nil; selectionRect = nil
+        start = nil; current = nil; originalBounds = nil; resize = false; endpoint = nil; endpointElement = nil; selectionRect = nil
         if !hasRetainedInk { ignoringInk = true; ink.drawing = PKDrawing(); ignoringInk = false }
         editor?.delegate = nil; editor?.removeFromSuperview(); editor = nil; editingElement = nil; editingOriginal = nil; isAccessibilityElement = true
         let active = isUsingTool; isUsingTool = false
-        if active { onToolContactEnded?() }; reload()
+        if active { onToolContactEnded?() }; updateInput(); reload()
     }
     override func draw(_ rect: CGRect) {
         guard let c = UIGraphicsGetCurrentContext() else { return }
+        prepareFrame()
         c.saveGState(); c.translateBy(x: viewport.x, y: viewport.y); c.scaleBy(x: viewport.zoom, y: viewport.zoom)
         var painted = items
-        if !navigating, tool == .select, !resize, endpoint == nil, selectionRect == nil,
-           let a = start, let b = current, selection.count <= 256 {
-            painted = items.map { item in
-                guard selection.contains(item.element.id) else { return item }
-                var e = item.element; e.x += b.x - a.x; e.y += b.y - a.y
-                return BoardRenderItem(element: e, points: item.points?.map { [$0[0] + b.x - a.x, $0[1] + b.y - a.y] })
-            }
-        }
+        let moving = editable && !navigating && tool == .select && !resize && endpoint == nil && selectionRect == nil && start != nil
+        let offset = moving ? CGPoint(x: (current?.x ?? 0) - (start?.x ?? 0), y: (current?.y ?? 0) - (start?.y ?? 0)) : .zero
         if let a = start, let b = current, tool == .rectangle || tool == .arrow {
             let box = Self.rect(a, b)
             var e = BoardElement(kind: tool == .rectangle ? .rectangle : .arrow)
@@ -191,16 +268,22 @@ struct BoardViewport: Codable, Equatable {
             if tool == .rectangle { painted.insert(draft, at: painted.firstIndex(where: { $0.element.kind != .rectangle }) ?? painted.endIndex) }
             else { painted.append(draft) }
         }
-        renderer.draw(painted, board: engine.board, in: c, zoom: viewport.zoom)
-        if let box = try? engine.bounds(selection), !selection.isEmpty {
+        var hidden = erasedIDs
+        if let editingElement, editingElement.kind == .text { hidden.insert(editingElement.id) }
+        renderer.draw(painted, board: engine.board, in: c, zoom: viewport.zoom, displayScale: contentScaleFactor,
+                      moving: moving ? selectedIDs : [], offset: offset, hidden: hidden)
+        if let original = selectionBounds, !selection.isEmpty {
+            let box = BoardRect(x: original.x + offset.x, y: original.y + offset.y, width: original.width, height: original.height)
             c.setStrokeColor(UIColor.systemBlue.cgColor); c.setLineWidth(1 / viewport.zoom)
             c.stroke(box.cgRect)
-            let handle = CGRect(x: box.x + box.width - 5 / viewport.zoom, y: box.y + box.height - 5 / viewport.zoom, width: 10 / viewport.zoom, height: 10 / viewport.zoom)
-            c.setFillColor(UIColor.white.cgColor); c.fill(handle); c.stroke(handle)
-            if selection.count == 1, let item = items.first(where: { $0.element.id == selection[0] }),
+            if editable {
+                let handle = CGRect(x: box.x + box.width - 5 / viewport.zoom, y: box.y + box.height - 5 / viewport.zoom, width: 10 / viewport.zoom, height: 10 / viewport.zoom)
+                c.setFillColor(UIColor.white.cgColor); c.fill(handle); c.stroke(handle)
+            }
+            if editable, selection.count == 1, let item = items.first(where: { $0.element.id == selection[0] }),
                ["line", "arrow"].contains(item.element.kind.rawValue), let points = item.points {
                 for p in [points.first, points.last].compactMap({ $0 }) where p.count >= 2 {
-                    c.strokeEllipse(in: CGRect(x: p[0] - 5 / viewport.zoom, y: p[1] - 5 / viewport.zoom, width: 10 / viewport.zoom, height: 10 / viewport.zoom))
+                    c.strokeEllipse(in: CGRect(x: p[0] + offset.x - 5 / viewport.zoom, y: p[1] + offset.y - 5 / viewport.zoom, width: 10 / viewport.zoom, height: 10 / viewport.zoom))
                 }
             }
         }
@@ -220,30 +303,42 @@ struct BoardViewport: Codable, Equatable {
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         guard !ignoringInk, isUsingTool else { return }
         let drawing = BoardInk.worldDrawing(canvasView.drawing, viewport: contactViewport)
-        var elements: [BoardElement] = [], archives: [String: Data] = [:]
-        var z = (engine.board.elements.map { $0.z }.max() ?? 0) + 1
+        var converted: [BoardElement] = [], archives: [String: Data] = [:]
+        var z = nextZ
+        var failed = false
         for stroke in drawing.strokes {
             if let e = BoardInk.element(from: stroke, color: contactColor, width: contactWidth, z: z) {
-                elements.append(e); archives[e.id] = PKDrawing(strokes: [stroke]).dataRepresentation(); z += 1
-            }
+                converted.append(e); archives[e.id] = PKDrawing(strokes: [stroke]).dataRepresentation(); z += 1
+            } else { failed = true }
         }
-        // Keep contact locked across synchronous journal/apply callbacks.
-        if !elements.isEmpty {
-            let command = BoardCommand.put(elements)
-            retainedInk = (command, archives, drawing.dataRepresentation())
-            if onCommand?(command, archives) == true { acknowledgeRetainedInk() }
+        // A contact is atomic. Never save a partial conversion or clear richer raw ink.
+        if !drawing.strokes.isEmpty {
+            let data = drawing.dataRepresentation(), recoveryID = UUID().uuidString
+            let command: BoardCommand? = failed ? nil : .put(converted)
+            retainedInk = RetainedInk(command: command, archives: archives, drawing: drawing, data: data, recoveryID: recoveryID)
+            retainedViewport = contactViewport
+            if let command {
+                if onCommand?(command, archives) == true { acknowledgeRetainedInk() }
+            } else {
+                _ = onUnconvertedInk?(data, recoveryID)
+                onError?(BoardError.invalidDocument("The complete Pencil contact is retained for recovery because it could not be converted."))
+            }
         }
         isUsingTool = false; updateInput(); onToolContactEnded?(); reload()
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard activeTouch == nil, !isUsingTool, editable, !hasRetainedInk, tool != .pen,
+        guard activeTouch == nil, !isUsingTool,
               let touch = touches.first(where: { $0.type == .pencil || $0.type == .direct || $0.type == .indirectPointer }) else { return }
+        // Pen-mode fingers are handled by the ancestor's one-finger pan recognizer.
+        guard tool != .pen, touch.type != .pencil || (editable && !hasRetainedInk) else { return }
+        prepareFrame()
         activeTouch = touch
         let point = touch.location(in: self)
         let world = viewport.world(point)
-        let handle = (try? engine.bounds(selection)).map { hypot(world.x - $0.x - $0.width, world.y - $0.y - $0.height) < 12 / viewport.zoom } ?? false
-        navigating = tool == .hand || (tool == .select && touch.type == .direct && !handle && (try? engine.hit(world, tolerance: 6 / viewport.zoom)) == nil)
+        let handle = editable && nearSelectionHandle(world, radius: touch.type == .direct ? 20 : 12)
+        navigating = tool == .hand || hasRetainedInk || (!editable && tool != .select) ||
+            (tool == .select && touch.type == .direct && !handle && (try? engine.hit(world, tolerance: 6 / viewport.zoom)) == nil)
         if navigating { start = viewport.world(point); current = start; isUsingTool = true }
         else { begin(at: point) }
     }
@@ -253,7 +348,7 @@ struct BoardViewport: Codable, Equatable {
         if navigating, let previous = current {
             viewport.x += (next.x - previous.x) * viewport.zoom
             viewport.y += (next.y - previous.y) * viewport.zoom
-            current = viewport.world(touch.location(in: self)); setNeedsDisplay(); onViewport?(viewport); return
+            current = viewport.world(touch.location(in: self)); setNeedsDisplay(); updateAccessibilityViewport(); onViewport?(viewport); return
         }
         if tool == .erase { collectErased(from: current ?? next, to: next) }
         current = next; setNeedsDisplay()
@@ -269,24 +364,26 @@ struct BoardViewport: Codable, Equatable {
     }
 
     func begin(at point: CGPoint) {
-        guard editable, !hasRetainedInk, !isUsingTool else { return }
+        guard !hasRetainedInk, !isUsingTool, editable || tool == .select else { return }
+        prepareFrame()
         let p = viewport.world(point); start = p; current = p; isUsingTool = true
         do {
             if tool == .erase { collectErased(from: p, to: p) }
             if tool == .select {
-                if let box = try engine.bounds(selection), !selection.isEmpty {
+                if let box = selectionBounds, !selection.isEmpty, editable {
                     originalBounds = box
-                    resize = hypot(p.x - box.x - box.width, p.y - box.y - box.height) < 12 / viewport.zoom
+                    let radius = (activeTouch?.type == .direct ? 20.0 : 12.0) / viewport.zoom
+                    resize = hypot(p.x - box.x - box.width, p.y - box.y - box.height) < radius
                     if selection.count == 1, let item = items.first(where: { $0.element.id == selection[0] }), ["line", "arrow"].contains(item.element.kind.rawValue), let points = item.points {
                         for (i, v) in [(0, points.first), (1, points.last)] {
-                            if let v, v.count >= 2, hypot(p.x - v[0], p.y - v[1]) < 12 / viewport.zoom { endpoint = i; endpointElement = item.element; resize = false }
+                            if let v, v.count >= 2, hypot(p.x - v[0], p.y - v[1]) < radius { endpoint = i; endpointElement = item.element; resize = false }
                         }
                     }
                     if resize || endpoint != nil { return }
                 }
                 if let id = try engine.hit(p, tolerance: 6 / viewport.zoom) {
                     if !selection.contains(id) { select([id]) }
-                    originalBounds = try engine.bounds(selection)
+                    originalBounds = selectionBounds
                 } else { select([]); originalBounds = nil; selectionRect = .zero }
             }
         } catch { onError?(error); cancelGesture() }
@@ -303,6 +400,8 @@ struct BoardViewport: Codable, Equatable {
         do {
             switch tool {
             case .select:
+                if selectionRect != nil { select(try engine.query(rect).filter { !$0.element.locked }.map { $0.element.id }); return }
+                guard editable else { return }
                 if var e = endpointElement, let endpoint {
                     guard a.x != b.x || a.y != b.y else { return }
                     guard let resolved = items.first(where: { $0.element.id == e.id })?.points, resolved.count >= 2 else { return }
@@ -320,15 +419,13 @@ struct BoardViewport: Codable, Equatable {
                         e.points = points.map { [$0[0] - minX, $0[1] - minY] }
                     }
                     onCommand?(.put([e]), [:])
-                } else if selectionRect != nil {
-                    select(try engine.query(rect).map { $0.element.id })
                 } else if resize, let box = originalBounds {
                     guard a.x != b.x || a.y != b.y else { return }
                     let w = max(1, box.width + b.x - a.x), h = max(1, box.height + b.y - a.y)
                     if selection.count > 1 {
                         let factor = box.width > 0 ? w / box.width : h / max(box.height, 1)
                         onCommand?(.resizeGroup(selection, rect: BoardRect(x: box.x, y: box.y, width: box.width * factor, height: box.height * factor)), [:])
-                    } else if let id = selection.first, var e = engine.board.element(id) {
+                    } else if let id = selection.first, var e = elements[id] {
                         let width = max(1, e.width + b.x - a.x), height = max(1, e.height + b.y - a.y)
                         if e.kind == .text {
                             e.textWrapWidth = width
@@ -345,7 +442,7 @@ struct BoardViewport: Codable, Equatable {
                 var e = BoardElement(kind: tool == .rectangle ? .rectangle : .arrow)
                 e.x = rect.x; e.y = rect.y; e.width = rect.width; e.height = rect.height
                 e.stroke = strokeColor; e.fill = fillColor; e.strokeWidth = strokeWidth
-                e.z = (engine.board.elements.map { $0.z }.max() ?? 0) + 1
+                e.z = nextZ
                 if tool == .arrow {
                     let first = try engine.binding(a, tolerance: 12 / viewport.zoom, toward: b)
                     let last = try engine.binding(b, tolerance: 12 / viewport.zoom, toward: a)
@@ -361,7 +458,7 @@ struct BoardViewport: Codable, Equatable {
             case .text:
                 var e = BoardElement(kind: .text); e.x = b.x; e.y = b.y; e.stroke = strokeColor
                 e.autoFontSize = true; e.fontSize = 24; e.textWrapWidth = 0
-                e.z = (engine.board.elements.map { $0.z }.max() ?? 0) + 1
+                e.z = nextZ
                 beginText(e)
             default: break
             }
@@ -388,16 +485,37 @@ struct BoardViewport: Codable, Equatable {
         text.accessibilityIdentifier = "board.text-editor"
         text.textColor = BoardRenderer.color(element.stroke); text.text = element.text
         let point = viewport.screen(BoardPoint(x: element.x, y: element.y))
-        text.frame = CGRect(x: max(0, min(point.x, bounds.width - 240)), y: max(0, min(point.y, bounds.height - 160)), width: min(400, bounds.width), height: 160)
+        text.translatesAutoresizingMaskIntoConstraints = false
         let toolbar = UIToolbar(); toolbar.sizeToFit()
         toolbar.items = [UIBarButtonItem(barButtonSystemItem: .cancel, target: self, action: #selector(cancelText)),
                          UIBarButtonItem(systemItem: .flexibleSpace),
                          UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(finishText))]
         text.inputAccessoryView = toolbar
         editingElement = element; editingOriginal = element; editor = text; text.delegate = self
-        isUsingTool = true; isAccessibilityElement = false; addSubview(text); text.becomeFirstResponder()
+        isUsingTool = true; isAccessibilityElement = false; addSubview(text)
+        let top = text.topAnchor.constraint(equalTo: topAnchor, constant: max(8, point.y))
+        let left = text.leadingAnchor.constraint(equalTo: leadingAnchor, constant: max(8, point.x))
+        let width = text.widthAnchor.constraint(equalToConstant: 400), height = text.heightAnchor.constraint(equalToConstant: 160)
+        [top, left, width, height].forEach { $0.priority = .defaultHigh }
+        NSLayoutConstraint.activate([top, left, width, height,
+            text.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 8),
+            text.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            text.topAnchor.constraint(greaterThanOrEqualTo: topAnchor, constant: 8),
+            text.bottomAnchor.constraint(lessThanOrEqualTo: keyboardLayoutGuide.topAnchor, constant: -8)])
+        text.becomeFirstResponder(); setNeedsDisplay()
     }
-    @objc private func finishText() { editor?.resignFirstResponder() }
+    func prepareContextMenu() -> Bool {
+        guard !isEditingText, [.select, .hand, .pen].contains(tool) else { return false }
+        // UIKit asks for configuration at touch-down, before it knows whether
+        // this will be a drag. Only actual menu presentation may cancel contact.
+        return !isUsingTool || activeTouch?.type == .direct || activeTouch?.type == .indirectPointer
+    }
+    @discardableResult func finishEditingText() -> Bool {
+        guard let editor else { return true }
+        if editor.isFirstResponder { editor.resignFirstResponder() } else { textViewDidEndEditing(editor) }
+        return self.editor == nil
+    }
+    @objc private func finishText() { _ = finishEditingText() }
     @objc private func cancelText() { cancelGesture() }
     func textViewDidEndEditing(_ textView: UITextView) {
         guard var e = editingElement else { return }
@@ -405,7 +523,7 @@ struct BoardViewport: Codable, Equatable {
         guard source.unicodeScalars.count <= 100000 else {
             onError?(BoardError.invalidDocument("Text exceeds 100,000 characters; the editor has retained it.")); textView.becomeFirstResponder(); return
         }
-        let isNew = engine.board.element(e.id) == nil
+        let isNew = elements[e.id] == nil
         if source != (editingOriginal?.text ?? "") || editingOriginal?.text != nil { e.text = source }
         else { e.text = nil }
         if e != editingOriginal, !(isNew && source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
@@ -428,13 +546,14 @@ struct BoardViewport: Codable, Equatable {
     }
 
     @objc private func opened(_ gesture: UITapGestureRecognizer) {
-        guard !isUsingTool else { editor?.resignFirstResponder(); return }
+        guard !isUsingTool else { _ = finishEditingText(); return }
+        prepareFrame()
         do {
             let point = viewport.world(gesture.location(in: self))
             let id = try engine.hit(point, tolerance: 6 / viewport.zoom)
-            var e = id.flatMap { engine.board.element($0) }
+            var e = id.flatMap { elements[$0] }
             if let group = e?.groupId {
-                let texts = engine.board.elements.filter { !$0.deleted && !$0.locked && $0.groupId == group && $0.kind == .text }.filter { item in
+                let texts = (groups[group] ?? []).compactMap { elements[$0] }.filter { !$0.deleted && !$0.locked && $0.kind == .text }.filter { item in
                     let dx = point.x - item.x - item.width / 2, dy = point.y - item.y - item.height / 2
                     let x = dx * cos(item.angle) + dy * sin(item.angle) + item.width / 2
                     let y = -dx * sin(item.angle) + dy * cos(item.angle) + item.height / 2
@@ -457,12 +576,29 @@ struct BoardViewport: Codable, Equatable {
         zoom(by: gesture.scale, at: gesture.location(in: self)); gesture.scale = 1
     }
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === openGesture || gestureRecognizer === pan || gestureRecognizer === pointerPan || gestureRecognizer === pinch else {
+            // UIKit's context-menu recognizer owns its own eligibility. Blocking
+            // every unknown recognizer while a raw finger is down prevents it opening.
+            return super.gestureRecognizerShouldBegin(gestureRecognizer)
+        }
+        if gestureRecognizer === openGesture {
+            guard tool == .pen || tool == .select || tool == .hand || !editable else { return false }
+            if isUsingTool, activeTouch?.type == .direct || activeTouch?.type == .indirectPointer { cancelGesture() }
+            return !isUsingTool
+        }
         // Navigation can cancel an unfinished finger draft, never an active Pencil/editor.
         if isUsingTool, activeTouch?.type == .direct,
-           gestureRecognizer === pinch || (gestureRecognizer === pan && pan.numberOfTouches >= 2) {
+           gestureRecognizer === pinch || (gestureRecognizer === pan && (pan.numberOfTouches >= 2 || !editable)) {
             cancelGesture()
         }
         return !isUsingTool
+    }
+    private func nearSelectionHandle(_ point: BoardPoint, radius: Double) -> Bool {
+        let tolerance = radius / viewport.zoom
+        if let box = selectionBounds, hypot(point.x - box.x - box.width, point.y - box.y - box.height) < tolerance { return true }
+        guard selection.count == 1, let item = items.first(where: { $0.element.id == selection[0] }),
+              item.element.kind == .line || item.element.kind == .arrow, let points = item.points else { return false }
+        return [points.first, points.last].compactMap { $0 }.contains { $0.count >= 2 && hypot(point.x - $0[0], point.y - $0[1]) < tolerance }
     }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         (gestureRecognizer === pan || gestureRecognizer === pointerPan || gestureRecognizer === pinch) && (otherGestureRecognizer === pan || otherGestureRecognizer === pointerPan || otherGestureRecognizer === pinch)

@@ -128,4 +128,72 @@ import PencilKit
         XCTAssertFalse(try XCTUnwrap(archives.last?[elements[1].id]).isEmpty)
     }
 
+    func testRetainedInkOverlayFollowsNavigationWithoutChangingRecoveryArchive() throws {
+        let engine: BoardEngine
+        do { engine = try BoardEngine(board: .empty) }
+        catch BoardError.unavailable { throw XCTSkip("Native engine archive is not linked") }
+        let surface = BoardSurface(engine: engine); surface.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+        surface.layoutIfNeeded(); surface.tool = .pen
+        let canvas = try XCTUnwrap(surface.subviews.compactMap { $0 as? PKCanvasView }.first)
+        surface.onCommand = { _, _ in false }
+        surface.canvasViewDidBeginUsingTool(canvas); canvas.drawing = drawing(); surface.canvasViewDidEndUsingTool(canvas)
+        let archive = try XCTUnwrap(surface.retainedInkData())
+        surface.setViewport(BoardViewport(x: 120, y: -15, zoom: 2)); surface.prepareFrame()
+        let restored = BoardInk.worldDrawing(canvas.drawing, viewport: surface.viewport)
+        XCTAssertEqual(restored.bounds.minX, drawing().bounds.minX, accuracy: 0.01)
+        XCTAssertEqual(restored.bounds.minY, drawing().bounds.minY, accuracy: 0.01)
+        XCTAssertEqual(surface.retainedInkData(), archive)
+    }
+
+    func testUnrepresentableContactRetainsAllStrokesAndStableRawRecoveryID() throws {
+        let engine: BoardEngine
+        do { engine = try BoardEngine(board: .empty) }
+        catch BoardError.unavailable { throw XCTSkip("Native engine archive is not linked") }
+        let surface = BoardSurface(engine: engine); surface.tool = .pen
+        let canvas = try XCTUnwrap(surface.subviews.compactMap { $0 as? PKCanvasView }.first)
+        let original = drawing(), outside = original.transformed(using: CGAffineTransform(translationX: 1e7, y: 0))
+        let mixed = PKDrawing(strokes: original.strokes + outside.strokes)
+        var commands = 0, ids: [String] = [], saved: [Data] = []
+        surface.onCommand = { _, _ in commands += 1; return true }
+        surface.onUnconvertedInk = { data, id in saved.append(data); ids.append(id); return true }
+        surface.canvasViewDidBeginUsingTool(canvas); canvas.drawing = mixed; surface.canvasViewDidEndUsingTool(canvas)
+        XCTAssertEqual(commands, 0, "A valid first stroke must not cause a partial contact save")
+        XCTAssertTrue(surface.hasRetainedInk)
+        XCTAssertEqual(try PKDrawing(data: XCTUnwrap(surface.retainedInkData())).strokes.count, 2)
+        surface.retryRetainedInk()
+        XCTAssertEqual(ids.count, 2); XCTAssertEqual(ids.first, ids.last); XCTAssertEqual(saved.first, saved.last)
+        XCTAssertEqual(commands, 0); XCTAssertEqual(canvas.drawing.strokes.count, 2)
+    }
+
+    func testDecodedNativeInkAndTilesSurviveFramesAndFractionalZoom() throws {
+        let archiveDrawing = drawing().transformed(using: CGAffineTransform(scaleX: 1000, y: 1000))
+        let archive = archiveDrawing.dataRepresentation()
+        let element = try XCTUnwrap(BoardInk.element(from: archiveDrawing.strokes[0], color: "#ff0000", width: 1, z: 0))
+        let item = BoardRenderItem(element: element, points: element.points?.map { [$0[0] + element.x, $0[1] + element.y] })
+        let renderer = BoardRenderer(); var resolutions = 0
+        renderer.nativeStroke = { _ in resolutions += 1; return archive }
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1; format.opaque = true
+        func frame(_ zoom: Double) -> UIImage {
+            UIGraphicsImageRenderer(size: CGSize(width: 80, height: 80), format: format).image { output in
+                UIColor.white.setFill(); output.fill(CGRect(x: 0, y: 0, width: 80, height: 80))
+                output.cgContext.scaleBy(x: zoom, y: zoom)
+                renderer.draw([item], board: .empty, in: output.cgContext, zoom: zoom)
+            }
+        }
+        let image = frame(0.001), rasterCount = renderer.nativeRasterCount
+        XCTAssertGreaterThan(rasterCount, 0)
+        for i in 0..<40 { _ = frame(0.001 + Double(i) * 0.000001) }
+        XCTAssertEqual(renderer.nativeDecodeCount, 1); XCTAssertEqual(resolutions, 1)
+        XCTAssertEqual(renderer.nativeRasterCount, rasterCount); XCTAssertEqual(renderer.pathBuildCount, 0)
+        let cg = try XCTUnwrap(image.cgImage)
+        var bytes = [UInt8](repeating: 0, count: 80 * 80 * 4)
+        let c = try XCTUnwrap(CGContext(data: &bytes, width: 80, height: 80, bitsPerComponent: 8, bytesPerRow: 80 * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        c.draw(cg, in: CGRect(x: 0, y: 0, width: 80, height: 80))
+        let middle = (40 * 80 + 40) * 4
+        XCTAssertLessThan(bytes[middle], 64); XCTAssertLessThan(bytes[middle + 1], 64)
+        renderer.invalidateNativeInk(); _ = frame(0.001)
+        XCTAssertEqual(renderer.nativeDecodeCount, 1); XCTAssertEqual(renderer.nativeRasterCount, rasterCount)
+    }
+
 }

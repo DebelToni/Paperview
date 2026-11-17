@@ -64,6 +64,34 @@ import XCTest
         XCTAssertNil(item["autoFontSize"]); XCTAssertNil(item["textWrapWidth"])
         XCTAssertEqual(try JSONDecoder().decode(BoardDocument.self,from:data),engine.board)
     }
+    func testNativeDispatchPreservesCoordinateBitsAcrossRepeatedPollReplacement() throws {
+        var stroke = BoardElement(kind: .pen, id: "fractional-ink")
+        stroke.x = 435.21739130434787; stroke.y = 91.18181818181819
+        stroke.width = 21.217391304347828; stroke.height = 11.181818181818183
+        stroke.points = [[0, 0], [stroke.width, stroke.height]]
+        let original = BoardDocument(elements: [stroke])
+        let engine = try BoardEngine(board: original)
+        for _ in 0..<12 {
+            XCTAssertEqual(engine.board, original, "A JSON/C ABI roundtrip is not a local edit")
+            XCTAssertEqual(engine.board.elements[0].x.bitPattern, stroke.x.bitPattern)
+            XCTAssertEqual(engine.board.elements[0].y.bitPattern, stroke.y.bitPattern)
+            try engine.replace(original)
+        }
+        XCTAssertFalse(engine.canUndo)
+    }
+    func testContentGenerationChangesOnlyAfterSuccessfulDocumentResponses() throws {
+        let engine = try BoardEngine(board: BoardDocument(elements: [box()]))
+        let initial = engine.contentGeneration
+        _ = try engine.query(BoardRect(x: 0, y: 0, width: 500, height: 500))
+        _ = try engine.hit(BoardPoint(x: 20, y: 30), tolerance: 1)
+        _ = try engine.bounds()
+        XCTAssertEqual(engine.contentGeneration, initial)
+        try engine.apply(.move(["box"], dx: 1, dy: 0))
+        XCTAssertEqual(engine.contentGeneration, initial + 1)
+        var invalid = box(); invalid.width = -1
+        XCTAssertThrowsError(try engine.replace(BoardDocument(elements: [invalid])))
+        XCTAssertEqual(engine.contentGeneration, initial + 1)
+    }
     func testInvalidDocumentFailsWithoutFallback() throws {
         var invalid = box(); invalid.width = -1
         XCTAssertThrowsError(try BoardEngine(board:BoardDocument(elements:[invalid])))

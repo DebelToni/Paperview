@@ -26,21 +26,34 @@ extension SpaceAPI: BoardService {
         guard result.spaces.allSatisfy({ Self.validPathID($0.id) }), result.requests.allSatisfy({ Self.validPathID($0.id) && Self.validPathID($0.spaceID) }), result.outgoing.allSatisfy({ Self.validPathID($0.spaceID) }) else { throw PaperError.invalidResponse }
         return result
     }
+    private struct BoardPoll: Decodable {
+        var space: SpaceSummary
+        var board: BoardDocument?
+        var creators: [String: AnnotationCreator]
+        var papers: [PaperInfo]
+    }
+    private nonisolated static func decodeBoardPoll(_ data: Data) async throws -> BoardPoll {
+        var poll = try JSONDecoder().decode(BoardPoll.self, from: data)
+        if let board = poll.board { poll.board = canonicalBoard(board) }
+        return poll
+    }
+    private nonisolated static func boardPayload(revision: Int, board: BoardDocument) async throws -> Data {
+        struct Body: Encodable { var revision: Int; var board: BoardDocument }
+        return try JSONEncoder().encode(Body(revision: revision, board: canonicalBoard(board)))
+    }
     func space(id: String) async throws -> SpaceSnapshot {
         guard Self.validPathID(id) else { throw PaperError.invalidURL }
         let user = try await identity()
+        let identity = storageIdentity, generation = nativeSpaceGeneration
         let cached = nativeSpaceCache.flatMap { $0.space.id == id ? $0 : nil }
         var components = URLComponents(url: try endpoint(["spaces", id]), resolvingAgainstBaseURL: false)!
         if let cached { components.queryItems = [URLQueryItem(name: "known_revision", value: String(cached.space.revision))] }
         guard let target = components.url else { throw PaperError.invalidURL }
-        struct Poll: Decodable {
-            var space: SpaceSummary
-            var board: BoardDocument?
-            var creators: [String: AnnotationCreator]
-            var papers: [PaperInfo]
-        }
-        let result = try JSONDecoder().decode(Poll.self, from: await nativeRequest(target: target))
-        guard result.space.id == id, result.papers.allSatisfy({ $0.spaceID == id }), user != nil || !result.space.member else { throw PaperError.invalidResponse }
+        let data = try await nativeRequest(target: target)
+        let result = try await Self.decodeBoardPoll(data)
+        try Task.checkCancellation()
+        guard generation == nativeSpaceGeneration, identity == storageIdentity else { throw PaperError.invalidResponse }
+        guard result.space.revision >= 0, result.space.revision >= (cached?.space.revision ?? 0), result.space.id == id, result.papers.allSatisfy({ $0.spaceID == id }), user != nil || !result.space.member else { throw PaperError.invalidResponse }
         let board: BoardDocument
         if let changed = result.board { board = changed }
         else {
@@ -48,14 +61,28 @@ extension SpaceAPI: BoardService {
             board = cached.board
         }
         let snapshot = SpaceSnapshot(space: result.space, board: board, creators: result.creators, papers: result.papers)
-        nativeSpaceCache = snapshot
+        // Concurrent reads can finish out of order. Never regress the exact
+        // principal/space revision cache used to justify a later null board.
+        if nativeSpaceCache.map({ $0.space.id == id && $0.space.revision > snapshot.space.revision }) != true { nativeSpaceCache = snapshot }
         return snapshot
     }
     func saveBoard(id: String, revision: Int, board: BoardDocument) async throws -> Int {
-        struct Body: Encodable { var revision: Int; var board: BoardDocument }; struct Result: Decodable { var revision: Int }
-        guard Self.validPathID(id) else { throw PaperError.invalidURL }
+        struct Result: Decodable { var revision: Int }
+        guard Self.validPathID(id), revision >= 0 else { throw PaperError.invalidURL }
         try await requireAccount()
-        let result: Result = try await call(["spaces", id, "board"], method: "PUT", body: json(Body(revision: revision, board: board)))
+        let body = try await Self.boardPayload(revision: revision, board: board)
+        try Task.checkCancellation()
+        // A PUT response contains no canonical board. Invalidate before sending,
+        // including on a lost response; only a fresh GET may fill this cache.
+        nativeSpaceGeneration += 1
+        if nativeSpaceCache?.space.id == id { nativeSpaceCache = nil }
+        defer {
+            // Reads started during PUT can also have observed its old revision.
+            nativeSpaceGeneration += 1
+            if nativeSpaceCache?.space.id == id { nativeSpaceCache = nil }
+        }
+        let result: Result = try await call(["spaces", id, "board"], method: "PUT", body: body)
+        guard result.revision > revision else { throw PaperError.invalidResponse }
         return result.revision
     }
     func createSpace(title: String, visibility: String) async throws -> SpaceSummary {

@@ -31,7 +31,27 @@ struct BoardIssue: Equatable {
     var message: String
     var items: [String]? = nil
 }
-func sameBoard(_ a: BoardDocument, _ b: BoardDocument) -> Bool { a == b }
+// These are the only value defaults added by both server/board.py and Rust's
+// BoardDocument::canonicalize. Keep versions and every other optional field exact.
+func canonicalBoardElement(_ element: BoardElement) -> BoardElement {
+    var result = element
+    if result.kind == .text {
+        if result.fontSize == nil { result.fontSize = 18 }
+        if result.fontFamily == nil { result.fontFamily = "sans-serif" }
+    }
+    return result
+}
+func canonicalBoard(_ board: BoardDocument) -> BoardDocument {
+    var result = board
+    result.elements = board.elements.map(canonicalBoardElement)
+    return result.ordered
+}
+func sameBoard(_ a: BoardDocument, _ b: BoardDocument) -> Bool {
+    guard a.version == b.version, a.assets == b.assets, a.elements.count == b.elements.count else { return false }
+    if zip(a.elements, b.elements).allSatisfy({ canonicalBoardElement($0.0) == canonicalBoardElement($0.1) }) { return true }
+    let indexed = Dictionary(b.elements.map { ($0.id, canonicalBoardElement($0)) }, uniquingKeysWith: { _, b in b })
+    return indexed.count == b.elements.count && a.elements.allSatisfy { canonicalBoardElement($0) == indexed[$0.id] }
+}
 private func anchorIssues(_ board: BoardDocument) -> [BoardIssue] {
     let items = Dictionary(board.elements.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
     var result: [BoardIssue] = []
@@ -76,8 +96,12 @@ private func groupMembershipConflict(_ b: [String: BoardElement], _ l: [String: 
     }
     return false
 }
-private func reconcile(_ base: BoardDocument, _ local: BoardDocument, _ remote: BoardDocument, _ resolutions: [BoardResolution]) -> (BoardDocument?, [BoardConflict]) {
-    func index(_ board: BoardDocument) -> [String: BoardElement] { Dictionary(board.elements.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b }) }
+struct BoardMergeResult {
+    var board: BoardDocument?
+    var conflicts: [BoardConflict]
+}
+func reconcileBoards(_ base: BoardDocument, _ local: BoardDocument, _ remote: BoardDocument, resolutions: [BoardResolution] = []) -> BoardMergeResult {
+    func index(_ board: BoardDocument) -> [String: BoardElement] { Dictionary(board.elements.map { ($0.id, canonicalBoardElement($0)) }, uniquingKeysWith: { _, b in b }) }
     let before = index(base), ours = index(local), theirs = index(remote)
     var chosen: [String: BoardElement] = [:], required = Set<String>(), unresolved = Set<String>()
     var conflicts: [BoardConflict] = []
@@ -100,7 +124,7 @@ private func reconcile(_ base: BoardDocument, _ local: BoardDocument, _ remote: 
     let decisions = Dictionary(resolutions.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
     for (id, resolution) in decisions {
         let reviewed = [BoardReviewedItem(id: id, local: resolution.local, remote: resolution.remote)] + resolution.related
-        if reviewed.allSatisfy({ $0.local == ours[$0.id] && $0.remote == theirs[$0.id] }) { chosen[id] = resolution.choice == .local ? ours[id] : theirs[id] }
+        if reviewed.allSatisfy({ $0.local.map(canonicalBoardElement) == ours[$0.id] && $0.remote.map(canonicalBoardElement) == theirs[$0.id] }) { chosen[id] = resolution.choice == .local ? ours[id] : theirs[id] }
         else { unresolved.formUnion(reviewed.map(\.id)) }
     }
     for id in required where decisions[id] == nil { unresolved.insert(id) }
@@ -114,7 +138,8 @@ private func reconcile(_ base: BoardDocument, _ local: BoardDocument, _ remote: 
         if let ids = issue.items { links[ids[0], default: []].insert(ids[1]); links[ids[1], default: []].insert(ids[0]) }
     }
     for id in unresolved.sorted() { conflicts.append(.init(kind: .element, id: id, local: ours[id], remote: theirs[id], related: (links[id] ?? []).filter { $0 != id }.sorted().map(snapshot))) }
-    return (conflicts.isEmpty ? board : nil, conflicts)
+    conflicts.sort { $0.kind.rawValue == $1.kind.rawValue ? $0.id < $1.id : $0.kind.rawValue < $1.kind.rawValue }
+    return BoardMergeResult(board: conflicts.isEmpty ? board : nil, conflicts: conflicts)
 }
-func mergeBoards(_ base: BoardDocument, _ local: BoardDocument, _ remote: BoardDocument, resolutions: [BoardResolution] = []) -> BoardDocument? { reconcile(base, local, remote, resolutions).0 }
-func boardConflicts(_ base: BoardDocument, _ local: BoardDocument, _ remote: BoardDocument, resolutions: [BoardResolution] = []) -> [BoardConflict] { reconcile(base, local, remote, resolutions).1 }
+func mergeBoards(_ base: BoardDocument, _ local: BoardDocument, _ remote: BoardDocument, resolutions: [BoardResolution] = []) -> BoardDocument? { reconcileBoards(base, local, remote, resolutions: resolutions).board }
+func boardConflicts(_ base: BoardDocument, _ local: BoardDocument, _ remote: BoardDocument, resolutions: [BoardResolution] = []) -> [BoardConflict] { reconcileBoards(base, local, remote, resolutions: resolutions).conflicts }
